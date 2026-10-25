@@ -244,3 +244,28 @@ EVE_Ship_Builder/
 **保留待办**：
 1. **路由可维护性**：do_GET/do_POST 是长 if/elif 链（30+ 分支）。本地工具可用，但可改路由表/装饰器，并把每分支内联的 `urlparse` 提到函数顶部。
 2. **端口占用提示**：8765 被占时启动会静默失败，main 里可加端口检测与提示。
+
+---
+
+## 九、发布与配置分离
+
+**两套配置，互不污染**：
+
+| 类型 | 文件 | 是否入库 / 入包 | 说明 |
+|---|---|---|---|
+| 本地个人配置 | `builder_config.json` | 否（gitignore、不入包） | `root` / `target_mod` / `backup_root`，含本机路径，仅本机有效 |
+| 分发默认值 | 无文件 | — | 代码兜底：`ROOT=""`、`MOD_DIR=<工具目录>/_未设置目标mod`、`BACKUP_ROOT=<工具目录>/_backup`；用户在「游戏解包」选项卡填解包根后生成自己的配置 |
+
+**打包（唯一入口，勿手工压缩整个目录）**：
+
+```powershell
+.\build_release.ps1                                  # 输出到 dist/，版本号默认当天日期
+.\build_release.ps1 -Version 20261025 -OutDir "指定目录"
+```
+
+- 白名单 5 个文件：`server.py`、`x4_lookup.py`、`index.html`、`release\启动工具.bat`、`release\使用说明.txt`
+- 内置两道校验：禁止文件（配置/备份脚本）混入即中止；包内文本命中本机路径特征（如 `X4 exout`、`UP7_Real_EVE_Ships`）即中止
+- 发布模板放在 `release/` 目录（入库），重新出包不需要再手写启动器与说明
+
+**编码约定**：`启动工具.bat` 存 GBK（cmd 中文不乱码）；`build_release.ps1` 与 `使用说明.txt` 存 UTF-8 BOM（PowerShell 5.1 解析中文必需）。修改后务必保留编码，否则会报语法错。
+
