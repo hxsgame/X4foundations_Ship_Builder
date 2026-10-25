@@ -269,3 +269,5 @@ EVE_Ship_Builder/
 
 **编码约定**：`启动工具.bat` 存 GBK（cmd 中文不乱码）；`build_release.ps1` 与 `使用说明.txt` 存 UTF-8 BOM（PowerShell 5.1 解析中文必需）。修改后务必保留编码，否则会报语法错。
 
+**新 id 后缀（`id_suffix`）**：舰船/装备/Dock 三处「新 id 自动填充」共用一个后缀配置。代码默认 `_up`（分发包行为），本地 `builder_config.json` 设 `"id_suffix": "_up7"` 覆盖；前端启动时经 `/api/config` 读取，未配置则用默认值。
+

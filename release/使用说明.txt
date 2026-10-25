@@ -18,17 +18,14 @@ Windows 10/11  +  Python 3.9 或更高版本
 3. 保存设置，然后关闭窗口、重新双击「启动工具.bat」使配置生效。
 4. 之后在各功能选项卡里选择「目标 mod」目录即可开始使用。
 
---------------------------------------------------
 一、主要功能
 --------------------------------------------------
 1. 舰船模块
-   以现有舰船为模板，一键生成新舰船的全套 XML：舰船宏、storage 宏、
-   wares、shipgroups、t 名称、index 注册。新 id 自动追加 _up7。
+   修改现有舰船数据；以现有舰船为模板，一键生成新舰船的全套 XML（包括：舰船宏、storage 宏、wares、shipgroups、t 名称、index 注册。新 id 自动追加 _up）。
 2. 装备编辑
    修改已有装备/弹药/尾焰/爆炸的数值与引用，写入前自动备份。
 3. Dock 复用
-   复用现有 dock 的模型，只改 XML：waypoint 段整体替换，
-   dockingbay 连接只按 name 修改 group（含清空组名），几何 _data 指向原版不动。
+   复用现有 dock 的模型，只改 XML：waypoint 段整体替换，dockingbay 连接只按 name 修改 group（含清空组名），几何 _data 指向原版不动。
 4. 模型同步
    把 Blender 导出的船模同步进目标 mod（详见第二节）。
 5. 游戏解包 / Diff
@@ -37,20 +34,19 @@ Windows 10/11  +  Python 3.9 或更高版本
 --------------------------------------------------
 二、与 Blender 插件、XML 补全脚本的关系（重点）
 --------------------------------------------------
-本工具不建模、不生成网格，它负责“把 Blender 的产物接进游戏 mod”。
-整条链路有三个角色：
+本工具不建模、不生成网格，它负责“把 ego Blender Tools导出的Blender资产接进游戏 mod”。
+整条链路如下：
 
-  A. Blender 插件（组件/硬点插件，需自行安装）
-     在 Blender 里摆放硬点、组件连接点、waypoint、dockingbay，
-     然后导出为 XML（组件 XML、waypoints.xml）。
+  A. 本工具配套的 Blender 插件（X4_blender42_add_components_fixed_addon.py，组件/硬点/waypoints编辑插件，需在blender安装）：在 Blender 里摆放硬点、组件连接点、waypoint、dockingbay等。
 
-  B. 舰船 XML 补全脚本（X4_BlenToolOut_con_ImproveTool_easy_fixed.py）
-     专门处理 Blender 导出的组件 XML：补全硬点对应的连接宏引用、
-     生成左右镜像连接、同名连接去重、连接布局规范化、清理 waypoint。
-     注意：它不在本压缩包内，需要你另行准备。
+   B. 通过ego  Blender Tools 插件，把改好的模型导出为 XML（舰船 XML）。
 
-  C. 本工具
-     读取 A / B 的产物，写进目标 mod，并做注册、备份、校验。
+   C. 本工具
+     配置“模型同步”选项卡，指定各个路径，点击“开始同步”，工具会自动完成以下 D、E步骤。（其中“③ 外部 py 工具（处理舰船 xml）”路径即X4_BlenToolOut_con_ImproveTool_easy_fixed.py所在的文件路径。“⑤ 可覆盖文件结构导出路径”是个副本路径，用来生成带文件结构的修改内容副本，方便在备份目录修改时向真实游戏目录覆盖生效）。
+
+  D. 自动从egotools导出目录（X:\...\Destination\p1data\...）获取舰船资源（xml、data等）
+
+  E. 自动用配套舰船 XML 补全脚本（X4_BlenToolOut_con_ImproveTool_easy_fixed.py）专门处理 egotools Blender 导出的组件 XML：补全硬点对应的连接宏引用、生成左右镜像连接、同名连接去重、连接布局规范化、清理 waypoint。
 
   ▲ 典型链路 1：新舰船 / 换船模
     Blender 编辑模型与硬点
@@ -71,7 +67,7 @@ Windows 10/11  +  Python 3.9 或更高版本
   ▲ 典型链路 2：Dock 复用（不改模型，只改 XML）
     Blender 里摆好 waypoint 与 dockingbay 连接点
       → 插件导出 waypoints.xml（<waypoints> + <connections> 两段）
-      → 本工具「Dock 复用」：选 dock 模板 + 填新 id + 选该 xml
+      → 本工具「Dock 复用」：选 dock 模板 + 填新 id + 选该 xml（waypoints.xml）
       → 生成副本：waypoint 整体替换、dockingbay 按 name 只改 group，
         复制宏并写入 index 注册，几何仍指向原版模型
 
@@ -84,6 +80,7 @@ Windows 10/11  +  Python 3.9 或更高版本
 - 覆盖宏/组件前会自动备份到「解包根\_x4sb_backup」（可在配置中改路径）；
   模型同步另备份到 mod 内 _shipmodel_backup，只保留最近 3 次。
 - 所有配置保存在工具目录下的 builder_config.json，仅本机有效。
+- 新 id 自动追加的后缀可在 builder_config.json 里用 id_suffix 修改（默认 _up）。
 - 若备份失败，工具会中止写入，不会覆盖原文件。
 
 【常见问题】

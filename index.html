@@ -493,8 +493,8 @@
           <div class="hint" id="dk-tpl-info" style="margin-top:4px;font-size:12px;color:#8b949e;min-height:18px"></div>
         </div>
         <div>
-          <label>② 新 id（如 dockarea_eve_l_01_up7）</label>
-          <input id="dk-id" placeholder="dockarea_eve_l_01_up7" oninput="this._dkAuto=false">
+          <label>② 新 id</label>
+          <input id="dk-id" placeholder="dockarea_eve_l_01_up" oninput="this._dkAuto=false">
         </div>
         <div>
           <label>③ waypoint xml（Blender 导出，留空 = 保留模板原 waypoint）</label>
@@ -773,11 +773,16 @@ function zhTag(t){
   // tags 同类参考：常见词给「中文 原文」，具体 macro id 保留原样
   return (TAG_ZH[t] ? TAG_ZH[t] + " " : "") + t;
 }
+// 新 id 自动追加的后缀：默认 _up（分发包），本地可在 builder_config.json 设 id_suffix 覆盖（如 _up7）
+let ID_SUFFIX = "_up";
 async function loadConfig(){
   try {
     const c = await (await fetch("/api/config")).json();
     if (c.target_mod) { document.getElementById("target_mod").value = c.target_mod; saveKV("target_mod", c.target_mod); }
     if (c.mode && ["new","edit"].includes(c.mode)) document.getElementById("mode").value = c.mode;
+    if (c.id_suffix) { ID_SUFFIX = String(c.id_suffix); }
+    const dkId = document.getElementById("dk-id");
+    if (dkId) dkId.placeholder = "dockarea_eve_l_01" + ID_SUFFIX;
   } catch(e){}
 }
 async function loadFactions(){
@@ -942,13 +947,13 @@ async function dkInit(){
   if (el){
     ssel(el, opts, (v)=>{
       dkShowTplInfo(v);
-      // 自动填充新 id = 模板名 + _up7（仅当字段为空或之前是自动填充值）
+      // 自动填充新 id = 模板名 + 后缀（仅当字段为空或之前是自动填充值）
       const idEl = document.getElementById("dk-id");
       if (v && idEl && (!idEl.value || idEl._dkAuto)){
         const item = dkFind(v);
         if (item){
           let nid = item.name;
-          if (!nid.endsWith("_up7")) nid += "_up7";
+          if (!nid.endsWith(ID_SUFFIX)) nid += ID_SUFFIX;
           idEl.value = nid; idEl._dkAuto = true;
         }
       }
@@ -1358,10 +1363,10 @@ function onTpl(){
   fill(t); showRefs(t.size);
   const base = t.id.split("_"), nb = base[base.length-1];
   if (!document.getElementById("new_id").value) {
-    // 建议 ID 保留模板 id 中段名（去 ship_种族_尺寸_ 前缀的剩余部分），再追加 _up7
+    // 建议 ID 保留模板 id 中段名（去 ship_种族_尺寸_ 前缀的剩余部分），再追加后缀
     const mid = t.id.replace(/^ship_[a-z0-9]+_(l|xl)_/, "") || nb;
     let _sid = "ship_" + base[1] + "_" + base[2] + "_" + mid;
-    if (!_sid.endsWith("_up7")) _sid += "_up7";
+    if (!_sid.endsWith(ID_SUFFIX)) _sid += ID_SUFFIX;
     document.getElementById("new_id").value = _sid;
     // 名称建议沿用模板中/英文名（与修改模式一致）；尾段数字的 id（如 battleship_01）不再自动填成 "01"
     document.getElementById("name_zh").value = t.name_zh || t.name_en || t.name || nb.toUpperCase();
@@ -3282,8 +3287,8 @@ async function eqOnTpl(cls){
   const ct = document.getElementById("eqctags-"+cls);
   if (ct){ ct.value = r.conn_tags||""; eqTagSel(cls); }
   eqOwnerSet(cls, r.owner||"");
-  // 建议新 ID = 模板 id + _up7（用户可改；已含 _up7 则不再追加）
-  const _sug = id.endsWith("_up7") ? id : id + "_up7";
+  // 建议新 ID = 模板 id + 后缀（用户可改；已含后缀则不再追加）
+  const _sug = id.endsWith(ID_SUFFIX) ? id : id + ID_SUFFIX;
   document.getElementById("eqid-"+cls).value = _sug;
   eqStatus(cls, `已读取模板 ${id}（源 ${srcLabel(r.source)}）`);
   showEqChain(cls, id);
