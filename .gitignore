@@ -5,3 +5,4 @@ node_modules/
 /0
 builder_config.json
 _backup/
+backup_workdir_to_D.ps1
