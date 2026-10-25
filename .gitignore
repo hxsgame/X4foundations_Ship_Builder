@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+cache/
+node_modules/
+/0
+builder_config.json
+_backup/

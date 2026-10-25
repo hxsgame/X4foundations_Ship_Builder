@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "C:\Users\15536\Doubao\chats\2026-10-03\new-chat-1\EVE_Ship_Builder\_dbg.py", line 4, in <module>
+    r = server.equip_chain("turret", "turret_par_xl_beam_long")
+  File "C:\Users\15536\Doubao\chats\2026-10-03\new-chat-1\EVE_Ship_Builder\server.py", line 2306, in equip_chain
+    bcomp = _find_comp_global(bref)
+            ^^^^^^^^^^^^^^^^^
+NameError: name '_find_comp_global' is not defined
