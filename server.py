@@ -8163,6 +8163,17 @@ def unpack_cancel():
 
 def main():
     os.makedirs(os.path.dirname(BASE) if False else BASE, exist_ok=True)
+    # 先绑定端口：若已被占用（重复双击 server.py），直接打开页面后退出，不做预热
+    try:
+        srv = socketserver.ThreadingTCPServer(("127.0.0.1", 8765), H)
+    except OSError:
+        print("8765 端口已被占用，服务可能已在运行；直接打开页面。")
+        try:
+            import webbrowser
+            webbrowser.open("http://127.0.0.1:8765")
+        except Exception:
+            pass
+        return
     print("="*60)
     print("UP7 EVE 舰船制作工具 已启动")
     print("浏览器打开:  http://127.0.0.1:8765")
@@ -8175,7 +8186,7 @@ def main():
         bullet_scan()
     except Exception:
         pass
-    with socketserver.ThreadingTCPServer(("127.0.0.1", 8765), H) as s:
+    with srv as s:
         s.allow_reuse_address = True
         # 后台预热装备扫描与资产索引（首次冷扫数十秒，放后台避免阻塞监听；缓存热后选项卡秒开）
         def _warm():
@@ -8186,6 +8197,20 @@ def main():
             except Exception:
                 pass
         threading.Thread(target=_warm, daemon=True).start()
+        # 直接运行时自动打开浏览器：后台轮询，等端口真正开始监听再开，避免"拒绝连接"
+        def _open_browser():
+            import socket as _sk, webbrowser
+            for _ in range(50):
+                try:
+                    with _sk.create_connection(("127.0.0.1", 8765), timeout=0.3):
+                        break
+                except Exception:
+                    time.sleep(0.2)
+            try:
+                webbrowser.open("http://127.0.0.1:8765")
+            except Exception:
+                pass
+        threading.Thread(target=_open_browser, daemon=True).start()
         s.serve_forever()
 
 if __name__ == "__main__":

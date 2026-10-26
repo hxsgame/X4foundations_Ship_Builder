@@ -263,11 +263,11 @@ EVE_Ship_Builder/
 .\build_release.ps1 -Version 20261025 -OutDir "指定目录"
 ```
 
-- 白名单 5 个文件：`server.py`、`x4_lookup.py`、`index.html`、`release\启动工具.bat`、`release\使用说明.txt`
+- 白名单 4 个文件：`server.py`、`x4_lookup.py`、`index.html`、`release\使用说明.txt`（**不含 .bat/.ps1/.exe**——N 网自动安检会隔离含可执行脚本的包；server.py 已内置自动开浏览器 + 端口占用时直接开页面，双击即用）
 - 内置两道校验：禁止文件（配置/备份脚本）混入即中止；包内文本命中本机路径特征（如 `X4 exout`、`UP7_Real_EVE_Ships`）即中止
-- 发布模板放在 `release/` 目录（入库），重新出包不需要再手写启动器与说明
+- 发布模板放在 `release/` 目录（入库），重新出包不需要再手写说明
 
-**编码约定**：`启动工具.bat` 存 GBK（cmd 中文不乱码）；`build_release.ps1` 与 `使用说明.txt` 存 UTF-8 BOM（PowerShell 5.1 解析中文必需）。修改后务必保留编码，否则会报语法错。
+**编码约定**：`build_release.ps1` 与 `使用说明.txt` 存 UTF-8 BOM（PowerShell 5.1 解析中文必需）。修改后务必保留编码，否则会报语法错。（原 `启动工具.bat` 已随分享包去脚本化移除，N 网安检触发）
 
 **新 id 后缀（`id_suffix`）**：舰船/装备/Dock 三处「新 id 自动填充」共用一个后缀配置。代码默认 `_up`（分发包行为），本地 `builder_config.json` 设 `"id_suffix": "_up7"` 覆盖；前端启动时经 `/api/config` 读取，未配置则用默认值。
 

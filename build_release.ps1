@@ -11,11 +11,12 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 
 # 白名单：包内文件名 -> 仓库内源文件
+# 注意：不放 .bat/.ps1/.exe 等可执行类型（N 网自动安检会隔离含脚本的包）；
+#       启动方式改为双击 server.py（server 内已内置自动开浏览器与端口占用处理）。
 $manifest = [ordered]@{
     "server.py"    = "server.py"
     "x4_lookup.py" = "x4_lookup.py"
     "index.html"   = "index.html"
-    "启动工具.bat"  = "release\启动工具.bat"
     "使用说明.txt"  = "release\使用说明.txt"
 }
 
