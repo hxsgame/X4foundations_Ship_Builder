@@ -8,7 +8,7 @@ t 名称、index 注册），直接写入目标 mod 目录。
 
 运行：python server.py  → 浏览器打开 http://127.0.0.1:8765
 """
-import http.server, json, os, re, shutil, socketserver, threading, time, statistics
+import http.server, json, os, re, shutil, socketserver, threading, time, statistics, glob
 from x4_lookup import X4Lookup
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -1779,19 +1779,37 @@ def generate(d):
     # diff 补丁型模板（如 vro 覆盖原版船）：必须合并 base 后再复制，
     # 否则新船组件是 <diff> 原文，游戏报 "key name diff is not recognized" 加载失败
     ctxt = _read_ship_comp_txt(src_comp, tpl["size"], tpl["id"], tpl["source"])
-    # 改名 component name 与 source geometry 路径
+    # 改名 component name（必须，否则组件重名冲突）
     ctxt = ctxt.replace('name="%s"' % tpl["id"], 'name="%s"' % comp_name)
-    # source 路径: 模板 id 目录 -> 新 id 目录
-    ctxt = ctxt.replace("\\"+tpl["id"]+"_data", "\\"+comp_name+"_data")
-    ctxt = ctxt.replace("/"+tpl["id"]+"_data", "/"+comp_name+"_data")
-    # 几何路径归属：模板来自原版/DLC/其他 mod 时，<source geometry> 的 mod 段改为目标 mod（数据目录随目标走）
     mod_name = os.path.basename(mod)
-    if tpl["source"] == "vanilla":
-        ctxt = re.sub(r'(geometry=")assets([/\\])',
-                      lambda m: m.group(1) + "extensions" + m.group(2) + mod_name + m.group(2) + "assets" + m.group(2), ctxt)
-    elif tpl["source"] != mod_name:
-        ctxt = re.sub(r'(geometry="extensions[/\\])%s([/\\])' % re.escape(tpl["source"]),
-                      r'\g<1>%s\g<2>' % mod_name, ctxt)
+    _geo_warns = []
+    # 1b. data 目录先于组件写入复制：复制结果决定 geometry 改写。
+    # 数据就绪 → geometry 指向新数据目录；缺失/复制失败 → 保持指向模板数据（共享），
+    # 避免 geometry 悬空导致碰撞网格无效（玩家上船僵死的同类隐患）。
+    src_data = os.path.join(src_base, *un, tpl["id"] + "_data")
+    data_ready = False
+    if os.path.isdir(src_data):
+        dst_data = rel("assets", *un, comp_name + "_data")
+        try:
+            shutil.copytree(src_data, dst_data, dirs_exist_ok=True)
+            _disable_jcs(dst_data)   # 复制得到的 .jcs 会令游戏崩溃，统一加 .disabled（实测结论）
+            created.append(os.path.relpath(dst_data, mod))
+            data_ready = True
+        except (OSError, shutil.Error) as e:
+            _geo_warns.append("模型数据目录复制失败（%s）：新船共享模板模型数据" % e)
+    else:
+        _geo_warns.append("模板模型数据目录 %s_data 不存在：新船共享模板模型数据（geometry 未改写）" % tpl["id"])
+    if data_ready:
+        # source 路径: 模板 id 目录 -> 新 id 目录
+        ctxt = ctxt.replace("\\"+tpl["id"]+"_data", "\\"+comp_name+"_data")
+        ctxt = ctxt.replace("/"+tpl["id"]+"_data", "/"+comp_name+"_data")
+        # 几何路径归属：模板来自原版/DLC/其他 mod 时，<source geometry> 的 mod 段改为目标 mod（数据目录随目标走）
+        if tpl["source"] == "vanilla":
+            ctxt = re.sub(r'(geometry=")assets([/\\])',
+                          lambda m: m.group(1) + "extensions" + m.group(2) + mod_name + m.group(2) + "assets" + m.group(2), ctxt)
+        elif tpl["source"] != mod_name:
+            ctxt = re.sub(r'(geometry="extensions[/\\])%s([/\\])' % re.escape(tpl["source"]),
+                          r'\g<1>%s\g<2>' % mod_name, ctxt)
     # 挂载点 tags：按连接点写回新船 component（可选，按组/逐槽指定 tags）
     mtags = d.get("mount_tags") or []
     if mtags:
@@ -1805,18 +1823,6 @@ def generate(d):
     open(dst_comp, "w", encoding="utf-8").write(ctxt)
     created.append(os.path.relpath(dst_comp, mod))
 
-    # 1b. data 目录: ship_xxx_data\*
-    src_data = os.path.join(src_base, *un, tpl["id"] + "_data")
-    if os.path.isdir(src_data):
-        dst_data = rel("assets", *un, comp_name + "_data")
-        shutil.copytree(src_data, dst_data, dirs_exist_ok=True)
-        _disable_jcs(dst_data)   # 复制得到的 .jcs 会令游戏崩溃，统一加 .disabled（实测结论）
-        # 重命名目录内文件名前缀
-        for fn in os.listdir(dst_data):
-            if fn.startswith("part_"):  # part_main-xxx.xmf 等，不包含模板id，无需改
-                pass
-        created.append(os.path.relpath(dst_data, mod))
-
     # 1c. .ani 文件
     src_ani = os.path.join(src_base, *un, tpl["id"] + "_data.ani")
     if os.path.isfile(src_ani):
@@ -1825,43 +1831,40 @@ def generate(d):
         created.append(os.path.relpath(dst_ani, mod))
 
     # 1d. dockarea（XL 舰船可能引用 dockarea）
+    da_ok = False   # dockarea 组件+宏是否都已实际创建；否则不改宏引用、不注册（悬空注册会导致游戏崩溃）
+    _da_warns = []
     if tpl["dockarea"]:
         da_name = tpl["dockarea"].replace("_macro","")  # dockarea_spl_xl_hel_01
         # 新 dockarea 名：把模板短名替换成新名（保留后缀_01）
         base = da_name.rsplit("_",1)[0]                # dockarea_spl_xl_hel
         suffix = da_name.rsplit("_",1)[1]              # 01
         new_da = base.rsplit("_",1)[0] + "_" + name + "_" + suffix  # dockarea_spl_xl_golem_01
-        # 找 dockarea 组件与 macro
+        # 找 dockarea 组件与 macro：模板来源 → 原版 assets → 全部 extensions（含 DLC）依次搜索
+        _da_roots = [src_base, os.path.join(ROOT, "assets")]
+        _da_roots += sorted(glob.glob(os.path.join(ROOT, "extensions", "*", "assets")))
+        def _da_find(rel_sub):
+            for _r in _da_roots:
+                _sd = os.path.join(_r, "structures", "dock", rel_sub) if rel_sub else os.path.join(_r, "structures", "dock")
+                if not os.path.isdir(_sd):
+                    continue
+                for root,_,files in os.walk(_sd):
+                    yield root, files
         da_comp = None
-        for root,_,files in os.walk(os.path.join(src_base,"structures","dock")):
+        for root, files in _da_find(""):
             if da_name+".xml" in files:
                 da_comp = os.path.join(root, da_name+".xml"); break
         if da_comp:
             dat = open(da_comp, encoding="utf-8").read()
             dat = dat.replace('name="%s"' % da_name, 'name="%s"' % new_da)
-            dat = dat.replace("\\"+da_name+"_data", "\\"+new_da+"_data")
-            dat = dat.replace("/"+da_name+"_data", "/"+new_da+"_data")
-            # 几何路径归属改写（与主 component 同规则）
-            if tpl["source"] == "vanilla":
-                dat = re.sub(r'(geometry=")assets([/\\])',
-                             lambda m: m.group(1) + "extensions" + m.group(2) + mod_name + m.group(2) + "assets" + m.group(2), dat)
-            elif tpl["source"] != mod_name:
-                dat = re.sub(r'(geometry="extensions[/\\])%s([/\\])' % re.escape(tpl["source"]),
-                             r'\g<1>%s\g<2>' % mod_name, dat)
+            # geometry 共享原版数据：不改 _data 目录名、不改归属前缀、不复制数据目录。
+            # 否则 geometry 会指向不存在的新名目录（如 DLC 模板时）→ 碰撞网格无效 → 玩家上船僵死。
             nd = rel("assets","structures","dock", new_da+".xml")
             os.makedirs(os.path.dirname(nd), exist_ok=True)
             open(nd,"w",encoding="utf-8").write(dat)
             created.append(os.path.relpath(nd, mod))
-            # data 目录
-            sdd = os.path.join(os.path.dirname(da_comp), da_name+"_data")
-            if os.path.isdir(sdd):
-                ddd = rel("assets","structures","dock", new_da+"_data")
-                shutil.copytree(sdd, ddd, dirs_exist_ok=True)
-                _disable_jcs(ddd)
-                created.append(os.path.relpath(ddd, mod))
             # macro
             da_mac = None
-            for root,_,files in os.walk(os.path.join(src_base,"structures","dock","macros")):
+            for root, files in _da_find("macros"):
                 if da_name+"_macro.xml" in files:
                     da_mac = os.path.join(root, da_name+"_macro.xml"); break
             if da_mac:
@@ -1872,6 +1875,11 @@ def generate(d):
                 os.makedirs(os.path.dirname(nm), exist_ok=True)
                 open(nm,"w",encoding="utf-8").write(dt)
                 created.append(os.path.relpath(nm, mod))
+                da_ok = True
+            else:
+                _da_warns.append("模板 dockarea 宏 %s_macro 未找到源文件：已保留原 dockarea 引用（共享模板），未注册 %s" % (da_name, new_da))
+        else:
+            _da_warns.append("模板 dockarea 组件 %s 未找到源文件：已保留原 dockarea 引用（共享模板），未注册 %s" % (da_name, new_da))
 
     # ---------- 2. 生成 ship macro ----------
     # 宏文件名可能带变体后缀（如 ship_atf_xl_battleship_01_a_macro.xml），用 _find_ship_macro 定位
@@ -1899,8 +1907,8 @@ def generate(d):
     m_st = re.search(r'<macro ref="(storage_[^"]+)"', mtxt)
     tpl_stor_name = m_st.group(1) if m_st else ""
     mtxt = re.sub(r'<macro ref="(storage_[^"]+)"', '<macro ref="%s"'%stor_id, mtxt)
-    # connections: dockarea 引用改名
-    if tpl["dockarea"]:
+    # connections: dockarea 引用改名（仅当新 dockarea 文件已实际生成；否则共享模板原引用）
+    if tpl["dockarea"] and da_ok:
         da_base = tpl["dockarea"].replace("_macro","")
         n = da_base.rsplit("_",1)[0].rsplit("_",1)[0]+"_"+name+"_"+da_base.rsplit("_",1)[1]
         mtxt = re.sub(r'<macro ref="%s_macro"'%da_base, '<macro ref="%s_macro"'%n, mtxt)
@@ -1910,7 +1918,7 @@ def generate(d):
         subst = {"{STORAGE}": stor_id}
         if tpl_stor_name:
             subst[tpl_stor_name] = stor_id          # 编辑行里的模板 storage 原名 → 新 storage 宏
-        if tpl["dockarea"]:
+        if tpl["dockarea"] and da_ok:
             subst["{DOCKAREA}"] = n + "_macro"
             subst[tpl["dockarea"].replace("_macro", "")] = n + "_macro"
             subst[tpl["dockarea"]] = n + "_macro"   # 兼容带/不带 _macro 两种写法
@@ -1965,7 +1973,7 @@ def generate(d):
         created.append(os.path.relpath(dst_st, mod))
 
     # ---------- 4. 更新注册文件 ----------
-    upd = update_registry(mod, comp_name, mac_name, stor_id, new_da if tpl["dockarea"] else None,
+    upd = update_registry(mod, comp_name, mac_name, stor_id, new_da if (tpl["dockarea"] and da_ok) else None,
                           faction, size, name, d, tids)
     modified += upd.get("files", [])
     # 材质：合并模板 mod 的材质 collection 到目标 mod material_library，避免新船依赖模板 mod
@@ -1985,8 +1993,8 @@ def generate(d):
     _refresh_soft()  # 舰船流不写装备/弹丸文件：轻量失效 t文本/wares索引/loadout/全局资产（免全量冷扫）
     return {"ok": True, "created": created, "modified": modified,
             "moding": moding, "moding_base": os.path.join(mod, "moding"),
-            "warnings": verify_model_refs(mod, dst_comp) + jobs_skip_warn(d.get("jobs")) + mtune_warns,
-            "tids": tids, "new_da": new_da if tpl["dockarea"] else None}
+            "warnings": verify_model_refs(mod, dst_comp) + jobs_skip_warn(d.get("jobs")) + mtune_warns + _geo_warns + _da_warns,
+            "tids": tids, "new_da": new_da if (tpl["dockarea"] and da_ok) else None}
 
 def verify_model_refs(mod, comp_path):
     """复制改名后只读抽查：component 引用的几何/材质等文件，在目标 mod（或原版 ROOT）中是否都存在。
@@ -5240,17 +5248,26 @@ def _copy_rename_asset(src_comp_dir, src_id, dst_comp_dir, new_id, conn_tags="",
                 ctxt = applied
             else:
                 return created, False   # 找不到 base 组件，放弃自有组件，回退复用原版 ref
+        # data 目录先于组件写入复制：成功 → geometry 随全局改名指向新目录；
+        # 缺失/失败 → geometry 回退指向模板数据目录（共享），避免悬空引用导致碰撞网格无效。
+        src_data = os.path.join(src_comp_dir, src_id + "_data")
+        data_ready = False
+        if os.path.isdir(src_data):
+            try:
+                created.append(_copy_dir_rename(src_data, os.path.join(dst_comp_dir, new_id + "_data"), src_id, new_id))
+                data_ready = True
+            except (OSError, shutil.Error):
+                pass
         if src_id in ctxt:
             ctxt = ctxt.replace(src_id, new_id)
+            if not data_ready:
+                ctxt = ctxt.replace(new_id + "_data", src_id + "_data")
         if conn_tags:
             ctxt = _set_mount_tags(ctxt, conn_tags, conn_name)
         os.makedirs(dst_comp_dir, exist_ok=True)
         dp = os.path.join(dst_comp_dir, new_id + ".xml")
         open(dp, "w", encoding="utf-8").write(ctxt)
         created.append(dp); copied = True
-        src_data = os.path.join(src_comp_dir, src_id + "_data")
-        if os.path.isdir(src_data):
-            created.append(_copy_dir_rename(src_data, os.path.join(dst_comp_dir, new_id + "_data"), src_id, new_id))
         src_ani = os.path.join(src_comp_dir, src_id + "_data.ani")
         if os.path.isfile(src_ani):
             adp = os.path.join(dst_comp_dir, new_id + "_data.ani")
