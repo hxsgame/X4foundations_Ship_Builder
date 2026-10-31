@@ -481,6 +481,24 @@
       <div style="margin-top:8px;font-size:11px;color:#8b949e">py 输出（末尾 4000 字符）</div>
       <div id="mi-log" style="margin-top:4px;background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;font-family:Consolas,monospace;font-size:12px;line-height:1.5;color:#8b949e;white-space:pre-wrap;max-height:260px;overflow:auto"></div>
     </div>
+    <div class="card">
+      <h2>组件装配（炮塔 / 护盾 / 引擎等，不跑 py）</h2>
+      <div class="hint">适用于 Blender 缩放复用的组件：以上方「② 资源路径」里的 ego 导出 xml 为模板，自动做 geometry 前缀修正 + container 补丁，复制 <code>_data</code>/<code>.ani</code>，从原版剥 <code>_x数字</code> 后缀找宏复制改名，并注册 index。资源路径 / 修改路径沿用上方 ②④。</div>
+      <div class="grid">
+        <div>
+          <label>组件 id（含缩放后缀，如 turret_par_l_plasma_01_mk1_x150）</label>
+          <input id="ca-id" placeholder="turret_par_l_plasma_01_mk1_x150">
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap">
+          <button class="btn" id="ca-run" onclick="caRun()">开始装配</button>
+          <span id="ca-status" style="font-size:12px;color:#8b949e"></span>
+        </div>
+      </div>
+      <div id="ca-result" style="display:none;margin-top:10px">
+        <div id="ca-steps" class="res-list"></div>
+        <div id="ca-warns" style="margin-top:6px;font-size:12px;color:#d29922"></div>
+      </div>
+    </div>
   </div>
   <div class="tabpane" id="pane-dockclone">
     <div class="card">
@@ -913,6 +931,31 @@ async function miRun(){
   steps.innerHTML=(r.steps||[]).map(s=>`<div class="${s.ok?"":"err"}">${s.ok?"✔":"✖"} ${esc(s.name)}${s.detail?(" — "+esc(s.detail)):""}</div>`).join("");
   log.textContent=(r.log||"").slice(-4000) || "（无输出）";
   if(r.ok){ st.style.color="#3fb950"; st.textContent="同步完成"; }
+  else { st.style.color="#ff7b72"; st.textContent="已中止：" + ((r.steps||[]).filter(s=>!s.ok).map(s=>s.name).join("、")||"失败"); }
+}
+
+// ── 组件装配（炮塔等，不跑 py） ──
+async function caRun(){
+  miSave();
+  const cid=(document.getElementById("ca-id").value||"").trim();
+  const exportRoot=miVal("mi-export"), mod=miVal("mi-mod");
+  const st=document.getElementById("ca-status"), btn=document.getElementById("ca-run");
+  const box=document.getElementById("ca-result"), steps=document.getElementById("ca-steps"), warns=document.getElementById("ca-warns");
+  if(!cid){ st.style.color="#ff7b72"; st.textContent="请填写组件 id"; return; }
+  if(!exportRoot){ st.style.color="#ff7b72"; st.textContent="请先填写上方 ② 资源路径"; return; }
+  if(!mod){ st.style.color="#ff7b72"; st.textContent="请先填写上方 ④ 修改路径"; return; }
+  st.style.color="#8b949e"; st.textContent="装配中…";
+  btn.disabled=true; box.style.display="none";
+  let r;
+  try{
+    r=await (await fetch("/api/componentassemble",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({component_id:cid, export_root:exportRoot, mod:mod})})).json();
+  }catch(e){ st.style.color="#ff7b72"; st.textContent="请求失败: "+e; btn.disabled=false; return; }
+  btn.disabled=false;
+  box.style.display="block";
+  steps.innerHTML=(r.steps||[]).map(s=>`<div class="${s.ok?"":"err"}">${s.ok?"✔":"✖"} ${esc(s.name)}${s.detail?(" — "+esc(s.detail)):""}</div>`).join("");
+  warns.textContent=(r.warnings||[]).join("；");
+  if(r.ok){ st.style.color="#3fb950"; st.textContent="装配完成"; }
   else { st.style.color="#ff7b72"; st.textContent="已中止：" + ((r.steps||[]).filter(s=>!s.ok).map(s=>s.name).join("、")||"失败"); }
 }
 
@@ -1906,12 +1949,9 @@ function renderInlineRef(row, kind){
 function mtAddRefRow(kind, el, tag){
   const row=el.closest(".matrow"); if(!row) return;
   const inp=row.querySelector(".mt-tags"); if(!inp) return;
-  // 已选则移除（整词精确匹配），未选则追加；统一按空格拆分再拼回，避免残留双空格/首尾空格
-  const cur=inp.value.trim().split(/\s+/).filter(Boolean);
-  const at=cur.indexOf(tag);
-  if(at>=0) cur.splice(at,1); else cur.push(tag);
-  inp.value=cur.join(" ");
-  const set=new Set(cur);
+  // 已选则移除（整词精确匹配），未选则追加；统一走 tagToggleValue（定义见装备区，函数声明提升）
+  tagToggleValue(inp, tag);
+  const set=new Set(inp.value.trim().split(/\s+/).filter(Boolean));
   row.querySelectorAll(".mtref-inline .chip").forEach(c=>c.classList.toggle("sel", set.has(c.getAttribute("data-tag"))));
 }
 function mtTagSel(kind, el){
@@ -1930,10 +1970,7 @@ function mtAddRef(kind, tag){
   let el = MTACTIVE && MTACTIVE.kind===kind ? MTACTIVE.el : null;
   if(!el) el = document.querySelector("#mt_"+kind+" .mt-tags");
   if(!el) return;
-  const cur=el.value.trim().split(/\s+/).filter(Boolean);
-  const at=cur.indexOf(tag);
-  if(at>=0) cur.splice(at,1); else cur.push(tag);
-  el.value=cur.join(" ");
+  tagToggleValue(el, tag);
   mtTagSel(kind, el);
 }
 function mtRenderRef(kind, force){
@@ -3454,10 +3491,16 @@ function eqTagSel(cls){
     c.classList.toggle("sel", !!(t && set.has(t)));
   });
 }
+// 多词 tags 点击：已选则移除、未选则追加（与舰船挂载点 mtAddRefRow 同一交互）
+function tagToggleValue(el, tag){
+  const cur = el.value.trim().split(/\s+/).filter(Boolean);
+  const at = cur.indexOf(tag);
+  if(at >= 0) cur.splice(at, 1); else cur.push(tag);
+  el.value = cur.join(" ");
+}
 function eqAddTag(cls, tag){
   const el = document.getElementById("eqctags-"+cls); if(!el) return;
-  const cur = el.value.trim().split(/\s+/).filter(Boolean);
-  if(!cur.includes(tag)){ cur.push(tag); el.value = cur.join(" "); }
+  tagToggleValue(el, tag);
   eqTagSel(cls);
 }
 function eqMTagSel(cls, box){
@@ -3468,8 +3511,7 @@ function eqMTagSel(cls, box){
 }
 function eqMTagAdd(cls, box, tag){
   const el = document.getElementById(box+"-"+cls); if(!el) return;
-  const cur = el.value.trim().split(/\s+/).filter(Boolean);
-  if(!cur.includes(tag)){ cur.push(tag); el.value = cur.join(" "); }
+  tagToggleValue(el, tag);
   eqMTagSel(cls, box);
 }
 function eqTrailSel(cls){

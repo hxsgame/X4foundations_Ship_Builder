@@ -775,6 +775,214 @@ def ship_model_sync(d):
     _refresh_soft()   # 组件/宏被整体替换：t文本/全局资产/组件内容缓存失效，列表立即可见
     return out
 
+# ── 组件装配（炮塔/护盾/引擎等）：ego xml 为模板 + 补丁 + data 复制 + macro 改名 + index 注册 ──
+def component_assemble(d):
+    """与 ship_model_sync 的区别：不跑外部 py（组件无硬点/镜像需求），
+    xml 补丁仅 geometry 前缀 + container；macro 从原版/扩展复制并改 name/component。"""
+    import xml.etree.ElementTree as ET
+    steps = []
+    def st(name, ok, detail=""):
+        steps.append({"name": name, "ok": bool(ok), "detail": detail or ""})
+        return bool(ok)
+    comp_id = (d.get("component_id") or "").strip()
+    export_root = (d.get("export_root") or "").strip()
+    mod = (d.get("mod") or "").strip()
+    out = {"ok": False, "component_id": comp_id, "steps": steps, "files": [], "warnings": []}
+    if not comp_id:
+        st("参数检查", False, "缺少组件 id"); return out
+    if not re.fullmatch(r'[A-Za-z0-9_.\-]+', comp_id):
+        st("参数检查", False, "组件 id 含非法字符: " + comp_id); return out
+    if not mod or not os.path.isdir(mod):
+        st("参数检查", False, "mod 路径不存在: " + (mod or "(空)")); return out
+    if not export_root or not os.path.isdir(export_root):
+        st("参数检查", False, "资源路径不存在: " + (export_root or "(空)")); return out
+
+    assets = os.path.join(export_root, "assets")
+    if not os.path.isdir(assets):
+        assets = export_root
+    src_xml = ""
+    for dirpath, _, files in os.walk(assets):
+        if (os.sep + "units" + os.sep) in (dirpath.lower() + os.sep):
+            continue
+        for f in files:
+            if f.lower() == (comp_id + ".xml").lower():
+                src_xml = os.path.join(dirpath, f); break
+        if src_xml:
+            break
+    if not src_xml:
+        st("定位导出文件", False, "资源路径里没有 %s.xml" % comp_id); return out
+    rel_dir = os.path.relpath(os.path.dirname(src_xml), assets)
+    st("定位导出文件", True, os.path.join("assets", rel_dir, comp_id + ".xml"))
+    src_data = os.path.join(os.path.dirname(src_xml), comp_id + "_data")
+    if not os.path.isdir(src_data):
+        st("定位模型目录", False, "缺少 %s_data 目录" % comp_id); return out
+    st("定位模型目录", True, src_data)
+
+    dst_dir = os.path.join(mod, "assets", rel_dir)
+    os.makedirs(dst_dir, exist_ok=True)
+    os.makedirs(os.path.join(dst_dir, "macros"), exist_ok=True)
+
+    # xml 补丁：geometry 直接改写为显式 mod 路径（数据必然复制进 mod，见下方复制步骤）。
+    # 不用 assets\ 裸路径——实测该写法只在数据属于原版时可解析，mod 自有数据会被拒载 meshsource。
+    # 与可用舰船（ship_par_xl_avatar_s 等）的 geometry 约定一致。
+    mod_folder = os.path.basename(os.path.normpath(mod))
+    geo_explicit = "extensions\\%s\\assets\\%s\\%s_data" % (mod_folder, rel_dir.replace("/", "\\"), comp_id)
+    text = open(src_xml, encoding="utf-8").read()
+    text = re.sub(r'geometry="[^"]*"', 'geometry="%s"' % geo_explicit, text)
+    n_container = len(re.findall(r'<connection name="container" tags=""\s*/>', text))
+    text = re.sub(r'<connection name="container" tags=""\s*/>',
+                  '<connection name="container" tags="contents" value="0"/>', text)
+    try:
+        ET.fromstring(text)
+    except Exception as e:
+        st("组件 XML 校验", False, str(e)); return out
+    dst_xml = os.path.join(dst_dir, comp_id + ".xml")
+    with open(dst_xml, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    out["files"].append(dst_xml)
+    st("组件 XML 补丁", True, "geometry 前缀已剥" + ("；container 已补" if n_container else ""))
+
+    dst_data = os.path.join(dst_dir, comp_id + "_data")
+    if os.path.isdir(dst_data):
+        shutil.rmtree(dst_data)
+    shutil.copytree(src_data, dst_data)
+    # 注意：组件流不禁用 .jcs——原版组件 data 同样带激活 .jcs，ego 新导出的缓存是有效的；
+    # 禁用仅舰船流保留（那边实测复制得到的 .jcs 会致崩溃）。
+    out["files"].append(dst_data)
+    src_ani = os.path.join(os.path.dirname(src_xml), comp_id + "_data.ani")
+    if os.path.isfile(src_ani):
+        shutil.copy2(src_ani, os.path.join(dst_dir, comp_id + "_data.ani"))
+        out["files"].append(os.path.join(dst_dir, comp_id + "_data.ani"))
+    n_files = sum(len(fs) for _, _, fs in os.walk(dst_data))
+    st("模型数据复制", True, "%d 个文件%s" % (n_files, "（含 .ani）" if os.path.isfile(src_ani) else ""))
+
+    # macro：剥 _x数字 后缀找原版宏，复制改名；找不到则告警不阻断
+    base = re.sub(r'_x\d+$', '', comp_id)
+    dst_macro = os.path.join(dst_dir, "macros", comp_id + "_macro.xml")
+    macro_done = False
+    if base != comp_id:
+        roots = [os.path.join(mod, "assets"), os.path.join(ROOT, "assets")]
+        roots += sorted(glob.glob(os.path.join(ROOT, "extensions", "*", "assets")))
+        macro_src = ""
+        for rdir in roots:
+            for dirpath, _, files in os.walk(rdir):
+                for f in files:
+                    if f.lower() == (base + "_macro.xml").lower():
+                        macro_src = os.path.join(dirpath, f); break
+                if macro_src:
+                    break
+            if macro_src:
+                break
+        if macro_src:
+            mtext = open(macro_src, encoding="utf-8").read()
+            mtext = mtext.replace('name="%s_macro"' % base, 'name="%s_macro"' % comp_id)
+            # 原版写法带空格（<component ref="x" />），字符串精确替换会静默失效 → 用正则（引号边界防止误配前缀同名 id）
+            mtext = re.sub(r'(<component\s+ref=")%s(")' % re.escape(base),
+                           r'\g<1>%s\g<2>' % comp_id, mtext, count=1)
+            try:
+                ET.fromstring(mtext)
+                if '<component ref="%s"' % comp_id not in mtext:
+                    st("宏生成", False, "component ref 替换后仍非 %s（原版格式异常）" % comp_id); return out
+                with open(dst_macro, "w", encoding="utf-8", newline="") as f:
+                    f.write(mtext)
+                out["files"].append(dst_macro)
+                macro_done = True
+                st("宏生成", True, "模板: " + macro_src)
+            except Exception as e:
+                st("宏生成", False, str(e)); return out
+        else:
+            out["warnings"].append("未找到原版宏 %s_macro.xml，已跳过宏生成（需手工建宏）" % base)
+            st("宏生成", True, "跳过：未找到 %s_macro.xml" % base)
+    else:
+        out["warnings"].append("组件 id 无 _x数字 后缀，按原样处理，未自动生成宏")
+        st("宏生成", True, "跳过（id 无缩放后缀）")
+
+    # index 注册：components.xml + macros.xml
+    mod_folder = os.path.basename(os.path.normpath(mod))
+    for idx_name, nm, rel_tail in [
+        ("components.xml", comp_id, rel_dir.replace("/", "\\") + "\\" + comp_id),
+        ("macros.xml", comp_id + "_macro", rel_dir.replace("/", "\\") + "\\macros\\" + comp_id + "_macro"),
+    ]:
+        if idx_name == "macros.xml" and not macro_done and not os.path.isfile(dst_macro):
+            continue
+        idx_path = os.path.join(mod, "index", idx_name)
+        if not os.path.isfile(idx_path):
+            out["warnings"].append("缺少 " + idx_path); continue
+        tree = ET.parse(idx_path)
+        ent = tree.getroot()
+        if nm not in {e.get("name") for e in ent}:
+            e = ET.SubElement(ent, "entry")
+            e.set("name", nm)
+            e.set("value", "extensions\\%s\\assets\\%s" % (mod_folder, rel_tail))
+            tree.write(idx_path, encoding="UTF-8", xml_declaration=True, short_empty_elements=True)
+    st("index 注册", True, "components.xml + macros.xml")
+
+    # 图标：复用源组件的升级贴图（否则装配界面/百科显示错图标或不显示模型）。
+    # 查找顺序：mod icons.xml 已有 upgrade_<base>_macro 条目 → 原版 icons.xml 同名条目 →
+    # 约定贴图 upgrades\<base>_macro.tga（.tga/.gz 存在即用，引擎两者都认）。
+    if base:
+        icons_path = os.path.join(mod, "libraries", "icons.xml")
+        new_icon_name = "upgrade_%s_macro" % comp_id
+        base_icon_name = "upgrade_%s_macro" % base
+        tex = None
+        if os.path.isfile(icons_path):
+            for e in ET.parse(icons_path).getroot().iter("icon"):
+                if e.get("name") == new_icon_name:
+                    tex = "exists"; break
+                if e.get("name") == base_icon_name and e.get("texture"):
+                    tex = e.get("texture")
+        if not tex:
+            van_icons = os.path.join(ROOT, "libraries", "icons.xml")
+            if os.path.isfile(van_icons):
+                for e in ET.parse(van_icons).getroot().iter("icon"):
+                    if e.get("name") == base_icon_name and e.get("texture"):
+                        tex = e.get("texture"); break
+        if not tex:
+            guess = "assets\\textures\\ui\\upgrades\\%s_macro.tga" % base
+            if os.path.isfile(os.path.join(ROOT, guess)) or os.path.isfile(os.path.join(ROOT, guess + ".gz")) \
+               or os.path.isfile(os.path.join(ROOT, guess.replace(".tga", ".gz"))):
+                tex = guess
+        if tex and tex != "exists":
+            if not os.path.isfile(icons_path):
+                out["warnings"].append("缺少 " + icons_path + "，未注册图标")
+            else:
+                tree = ET.parse(icons_path)
+                iroot = tree.getroot()
+                if new_icon_name not in {e.get("name") for e in iroot.iter("icon")}:
+                    ie = ET.SubElement(iroot, "icon")
+                    ie.set("name", new_icon_name)
+                    ie.set("texture", tex)
+                    ie.set("height", "256"); ie.set("width", "256")
+                    tree.write(icons_path, encoding="UTF-8", xml_declaration=True, short_empty_elements=True)
+                    st("图标注册", True, tex)
+                else:
+                    st("图标注册", True, "已存在")
+        elif tex == "exists":
+            st("图标注册", True, "已存在")
+        else:
+            out["warnings"].append("未找到源组件图标贴图（%s），装配界面/百科将无图标" % base_icon_name)
+            st("图标注册", False, "无可用贴图")
+
+    # 校验：组件里每个 geometry 目录在 mod/原版/扩展之一真实存在
+    geo_roots = [mod, ROOT] + sorted(glob.glob(os.path.join(ROOT, "extensions", "*")))
+    missing = []
+    for src in ET.parse(dst_xml).getroot().iter("source"):
+        g = src.get("geometry") or ""
+        if not g:
+            continue
+        gd = g.replace("\\\\", "\\").replace("/", "\\")
+        if not any(os.path.isdir(os.path.join(r, gd)) for r in geo_roots):
+            missing.append(g)
+    if missing:
+        out["warnings"].append("geometry 目录缺失: " + "; ".join(missing))
+        st("geometry 校验", False, "%d 处缺失" % len(missing))
+    else:
+        st("geometry 校验", True, "全部目录存在")
+
+    out["ok"] = all(s["ok"] for s in steps)
+    _refresh_soft()
+    return out
+
 # ── Dock 复用：原版 dock 组件 + 新 id + Blender 导出 waypoint xml ──
 _DOCK_CLASSES = ("dockarea", "dockingbay", "pier", "dock")
 _WP_TAGS = {"typenormal", "typedock", "dockpath", "entrypath", "exitpath",
@@ -4633,6 +4841,18 @@ def _write_equip_ware(mod, cls, eid, mac_name, d, name_tid, desc_tid, macro_clas
     open(jp, "w", encoding="utf-8").write(txt)
     return os.path.relpath(jp, mod)
 
+def _rewrite_ident_tids(mtxt, name_tid, desc_tid, count=1):
+    """把 macro identification 的 name/basename/shortname/description t 引用统一改到 7777771 专属页。
+    新建与编辑保存共用：不改则加载仍读原版页，表现为"改名不生效"。"""
+    def _rep(mm):
+        tag = mm.group(0)
+        tag = re.sub(r'\bname="\{[^"]*\}"', 'name="{7777771,%d}"' % name_tid, tag)
+        tag = re.sub(r'\bbasename="\{[^"]*\}"', 'basename="{7777771,%d}"' % name_tid, tag)
+        tag = re.sub(r'\bshortname="\{[^"]*\}"', 'shortname="{7777771,%d}"' % name_tid, tag)
+        tag = re.sub(r'\bdescription="\{[^"]*\}"', 'description="{7777771,%d}"' % desc_tid, tag)
+        return tag
+    return re.sub(r'<identification\b[^>]*>', _rep, mtxt, count=count)
+
 def _read_equip_tids(it):
     """读装备 macro identification name/description 的工具专属 t 引用 {7777771,id}。
     仅认 7777771 专属页，原版共享页引用不算，避免误改共享文本。返回 (name_tid, desc_tid)。"""
@@ -5262,6 +5482,14 @@ def _copy_rename_asset(src_comp_dir, src_id, dst_comp_dir, new_id, conn_tags="",
             ctxt = ctxt.replace(src_id, new_id)
             if not data_ready:
                 ctxt = ctxt.replace(new_id + "_data", src_id + "_data")
+        if data_ready:
+            # 几何归属统一为目标 mod 显式路径：src 可能是其他 mod 的 extensions\ 路径或 assets\ 裸路径，
+            # 全局改名后会指向 src 侧不存在的新名目录 / 引擎不解析的裸路径 → meshsource 拒载（x150 同类坑）。
+            m = re.match(r'(.*?)[/\\]assets[/\\](.*)$', dst_comp_dir)
+            if m:
+                geo = "extensions\\%s\\assets\\%s\\%s_data" % (
+                    os.path.basename(m.group(1)), m.group(2).replace("/", "\\"), new_id)
+                ctxt = re.sub(r'geometry="[^"]*"', 'geometry="%s"' % geo, ctxt)
         if conn_tags:
             ctxt = _set_mount_tags(ctxt, conn_tags, conn_name)
         os.makedirs(dst_comp_dir, exist_ok=True)
@@ -5379,14 +5607,7 @@ def equip_generate(d):
     # 修正 identification 的 t 引用：模板 identification 常引用原版 page（如 20105），
     # 与工具写入 7777771 页的名称/描述不一致，百科无法正确显示。统一替换为新分配 t id。
     name_tid, desc_tid = _alloc_tids(mod)
-    def _rep_ident(mm):
-        tag = mm.group(0)
-        tag = re.sub(r'\bname="\{[^"]*\}"', 'name="{7777771,%d}"' % name_tid, tag)
-        tag = re.sub(r'\bbasename="\{[^"]*\}"', 'basename="{7777771,%d}"' % name_tid, tag)
-        tag = re.sub(r'\bshortname="\{[^"]*\}"', 'shortname="{7777771,%d}"' % name_tid, tag)
-        tag = re.sub(r'\bdescription="\{[^"]*\}"', 'description="{7777771,%d}"' % desc_tid, tag)
-        return tag
-    mtxt = re.sub(r'<identification\b[^>]*>', _rep_ident, mtxt, count=1)
+    mtxt = _rewrite_ident_tids(mtxt, name_tid, desc_tid)
     mdp = os.path.join(dst_mac_dir, new_id + "_macro.xml")
     open(mdp, "w", encoding="utf-8").write(mtxt)
     created.append(wrel(mdp))
@@ -5491,6 +5712,10 @@ def equip_edit(d):
     src_mac = it["path"]
     mtxt = open(src_mac, encoding="utf-8", errors="ignore").read()
     mtxt = _apply_equip_fields(cls, mtxt, d.get("fields") or {})
+    # identification t 引用统一到 7777771 专属页：编辑模式原来只写 t 文本/ware、不改 macro，
+    # 重载读 macro 仍指原版页 → "改名不生效"。必须在写 macro 前解析并重写（与新建同一规则）。
+    name_tid, desc_tid = _resolve_tids(it, mod)
+    mtxt = _rewrite_ident_tids(mtxt, name_tid, desc_tid)
     if not _backup_before_edit(src_mac, "equip_" + cls):   # 先备份再覆盖（空值=删属性不可逆）
         return {"ok": False, "error": "备份失败，已中止写入: %s" % src_mac}
     open(src_mac, "w", encoding="utf-8").write(mtxt)
@@ -5550,7 +5775,7 @@ def equip_edit(d):
             for _c in eb.get("created") or []:
                 if _c not in modified:
                     modified.append(_c)
-    name_tid, desc_tid = _resolve_tids(it, mod)
+    # name_tid/desc_tid 已在写 macro 前解析（见上方 identification 重写），此处直接复用
     modified += _write_equip_txt(mod, eid, d, name_tid, desc_tid)
     mc_m = re.search(r'<macro\s+[^>]*\bclass="([^"]*)"', mtxt)
     wr = _write_equip_ware(mod, cls, eid, eid + "_macro", d, name_tid, desc_tid,
@@ -7784,7 +8009,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path not in ("/api/generate", "/api/edit", "/api/config", "/api/pickdir", "/api/dirtree",
                              "/api/equipgenerate", "/api/equipedit",
                              "/api/bulletgenerate", "/api/bulletedit", "/api/refresh",
-                             "/api/shipmodelsync", "/api/dockclone",
+                             "/api/shipmodelsync", "/api/componentassemble", "/api/dockclone",
                              "/api/shipgroup/save", "/api/explosionbuild", "/api/trailnew",
                              "/api/bulleteffectbuild", "/api/bullettrailbuild", "/api/bulletbeambuild", "/api/bulletvisbuild",
                              "/api/delitem", "/api/diffvalidate",
@@ -7814,6 +8039,10 @@ class H(http.server.BaseHTTPRequestHandler):
                 # EGO Blender 导出目录 → 目标 mod：py 处理 + macro 连接点归位 + 模型/ani/dae 覆盖 + moding 结构
                 d = json.loads(self.rfile.read(ln).decode("utf-8"))
                 r = ship_model_sync(d)
+            elif self.path == "/api/componentassemble":
+                # 组件（炮塔等）装配：ego xml 模板 + 补丁 + data 复制 + macro 改名 + index 注册
+                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                r = component_assemble(d)
             elif self.path == "/api/dockclone":
                 # 原版 dock 复用：组件/宏改名 + 可选替换 Blender 导出 waypoint + index 注册 + moding 结构
                 d = json.loads(self.rfile.read(ln).decode("utf-8"))
