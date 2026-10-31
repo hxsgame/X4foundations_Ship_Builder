@@ -279,3 +279,5 @@ EVE_Ship_Builder/
 | 2026-10-18 | ⑧-1 增强：宏清单全量扫描 catalog（607 宏/7 类，component 回退+白名单过滤）、入口下拉按所选宏切换、mcDefaultConn 语义默认值（buildmodule→object）、功能点补全行、component 缺失提示（硬锚点+悬空引用归 Blender 侧）、countermeasures/playercontrol 确认排除 |
 | 2026-10-18 | 新增 ⑧-1 macro 连接点模块：组件/macro connections 对应规则研究、读取接口 /api/shipconnections、generate/edit 整块替换写入（悬空 ref 拦截 + {STORAGE}/{DOCKAREA} 占位符）、前端行编辑 UI（复用 ssel + PENDING 兜底 + MC_SEQ 竞态守卫） |
 | 2026-10-17 | 初版。整合本次会话修复：材质竞态、模式切换重构、delitem 路径兼容、孤儿材质清理、新增模式 loadShipgroups 缺失、delItem id 格式修复 |
+| 2026-11-01 | 组件装配上线（模型同步选项卡 /api/componentassemble）：ego 导出 xml+_data → 显式 geometry → container 补丁 → data/.ani 复制 → 剥 _x数字 找原版宏改名 → index 注册 → 图标注册 → 几何存在性校验；Blender 侧简化为纯缩放+导出 |
+| 2026-11-01 | x150 炮塔修复链：① 编辑保存重写 macro identification t 引用（_rewrite_ident_tids 共用，改名重载不生效根因）② 宏 component ref 改正则+断言（原版带空格致静默失配指回原版组件）③ geometry mod 自有数据必须显式 extensions 路径（assets 裸路径 meshsource 拒载根因；_copy_rename_asset 同类隐患归一）④ 图标自动复用源组件贴图（原类默认光束贴图）⑤ 组件流不禁用 .jcs（原版同样激活，ego 导出有效）⑥ tags 同类参考点击 toggle 统一四处 |
