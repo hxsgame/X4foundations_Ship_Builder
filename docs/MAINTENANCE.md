@@ -1,6 +1,6 @@
 # EVE_Ship_Builder 工程维护文档
 
-> 最后更新：2026-10-23
+> 最后更新：2026-11-06
 > 适用版本：当前主干（server.py + index.html 单文件架构）
 
 ---
@@ -10,8 +10,8 @@
 | 项目 | 值 |
 |---|---|
 | 工程根目录 | `C:\Users\15536\Doubao\chats\2026-10-03\new-chat-1\EVE_Ship_Builder\` |
-| 前端 | `index.html`（单文件，~5500 行，含全部 JS/CSS，原生 ES6） |
-| 后端 | `server.py`（单文件，~6600 行，Python 3.9+ 原生 `http.server`） |
+| 前端 | `index.html`（单文件，~4000 行，含全部 JS/CSS，原生 ES6） |
+| 后端 | `server.py`（单文件，~8500 行，Python 3.9+ 原生 `http.server`） |
 | 启动方式 | 双击 `启动服务.bat` 或 `python server.py`，浏览器访问 `http://127.0.0.1:8765` |
 | X4 解包根 | `D:\Games\X4 exout` |
 | 当前目标 Mod | `UP7_Real_EVE_Ships` |
@@ -133,6 +133,15 @@ material_library.xml
 |---|---|---|
 | 修改 | **替换** | 就地重命名原材质，同时更新全 mod 所有引用该材质的 component |
 | 新增 | **克隆** | 克隆原材质为新副本，仅新船 component 换用新材质，原材质不动 |
+| 前缀换名（⑤-1 顶部） | **只增不改** | 本船材质全改为「新前缀.通用名」；材质库已有同名定义直接复用，缺失才新增副本；只改本船 component 引用，绝不重命名/删除已有材质，也不动其他舰船 |
+
+### 3.2.1 模型同步后的材质库对齐
+
+`ship_model_sync` 覆盖舰船 xml 后，会调用 `align_materials_after_sync()`：
+1. 读新 component 中 `<lods><lod><materials>` 的全部 `collection.material`；
+2. 全部已存在 → 直接复用，不改材质库；
+3. 有缺失才新增：克隆数据优先取「新 xml 中第一个已存在的材质」，全都缺失时用「覆盖前旧 xml 第一个材质」；
+4. **只新增，不删除、不改名，也不修改任何其他舰船 xml**。结果作为“材质库对齐”步骤显示在同步结果中。
 
 ### 3.3 删除时的孤儿清理
 
@@ -171,6 +180,8 @@ material_library.xml
 
 - `delitem` **不备份**（删除即真删，无法恢复）；
 - `delitem` **不同步** `moding/` 目录（与 generate/edit 行为不一致）。
+- **升级组兼容标签越界会直接崩游戏**（2026-11-08 实锤）：建造界面点某船炮塔槽即崩溃、dump 落在 `lua51_64.dll` 的随机地址。原版 `menu_ship_configuration.lua` 的 `setupGroupData()` 按「升级组数 n」分配 `EquipmentCompatibilityInfo` 缓冲，却按「连接兼容标签数 n_comp」写入，`n_comp > n` 时堆越界。`n_comp` = 连接 tags ∩ 8 个兼容标签（standard/missile/mining/highpower/venture/boron/xenon/advanced）。**铁律：任一连接的兼容标签数必须严格小于该船升级组数**；组数少的船（如 revelation 仅 3 组）加标签前先数一遍。
+- 同船出现 `has only turrets in group 'X'!` / `has no shields in engine group 'X'!` @Artists 警告不致命，但说明组结构不规范，建议按原版给每个组配护盾/引擎。
 
 ---
 
@@ -268,6 +279,15 @@ EVE_Ship_Builder/
 
 | 日期 | 内容 |
 |---|---|
+| 2026-11-08 | **revelation 建造界面点炮塔崩溃定位（原版 UI 兼容缓冲越界，用户实测修复）**：现象=点 `ship_par_xl_revelation` 炮塔槽直接崩、无 Lua 报错，minidump 落在 `lua51_64.dll` 且为写 `0x2EF10A11` / 读 `0x23` 等随机地址。根因=原版 `ui/addons/ego_detailmonitor/menu_ship_configuration.lua` 的 `setupGroupData()`（约 11300-11325 行）按升级组数 `n` 分配 `EquipmentCompatibilityInfo[?]` 缓冲、却按兼容标签数 `n_comp` 调 `C.GetUpgradeGroupCompatibilities()` 写入，`n_comp > n` 时堆越界（LuaJIT 内存损坏 → 随机地址 AV）。本例炮塔连接 tags 含 `standard advanced highpower missile boron` 共 5 个兼容标签，而全船只 3 个组（eng_g_01/left_g_01/right_g_01）→ 5 > 3。**用户删掉 3 个 tags 后 n_comp=2 < 3，崩溃消失，确认根因**。同时核查并排除：放大炮塔 `turret_par_l_plasma_01_mk1_x150` 与原版逐字段一致且 `large` 标签不进 `extralarge` 槽；舰船 xml 无 `<mesh>` 属正常（naglfar 同构）。已在 §4.3 补充铁律：**任一连接的兼容标签数必须严格小于该船升级组数**；同船 `has only turrets in group 'X'!` / `has no shields in engine group 'X'!` @Artists 警告可作结构预警 |
+| 2026-11-08 | **恢复被误删的 EVE 命名 shipgroup（右键生成表单 L/XL 消失）**：根因是 ⑥-1 关闭清理时 `_sg_strip_ship()` 把 `UP7_EVE_battleship_xl_01` 里最后一个 `<select>`（revelation）删掉后，`_sg_clean_empty()` 认为组已空而整块删除；`UP7_EVE_battleship_l_01` 在更早的清理中已丢失。而 `libraries/ships.xml` 的 `UP7_EVE_battleship_xl` / `UP7_EVE_battleship_l` 条目按名引用这两个组，组不存在 → 船定义失效 → 右键生成表单（`UP7_Right_Menu` 的 `get_ship_definition`）里 EVE L/XL 舰船整体消失。修复：① `shipgroups.xml` 末尾恢复两组定义（XL 6 艘：nyx/avatar/hel/naglfar/phoenix/revenant；L 12 艘：megathron/sin/legion/paladin/providence/tempest/tornado/typhoon/corax/drake/raven/vedmak，权重沿用 30/20）；revelation、avatar_s 已有独立 ships.xml 条目，不再放进该组以免重复。② `server.py` 新增 `_SG_RESERVED_GROUPS`，`_sg_strip_ship()` 对这两个命名组只清 `<select>`、保留组外壳，杜绝再次整组删除。验证：`ElementTree` 解析通过、`_shipgroups()` 读到 XL=6/L=12（共 492 组）、ast 通过、45 项单测全绿（新增 `test_clear_keeps_reserved_eve_group`）、8765 重启后 `/api/templates` 200。**改完需 Vortex Deploy 并重启游戏才生效** |
+| 2026-11-08 | **⑥-1 关闭即清理 + 旧接口删除 + shipgroups 脏数据清理**：① 删除失效的 `POST /api/shipgroup/save` 路由、白名单与 `shipgroup_save()` 整个函数（前端已无调用，逻辑并入整船保存）。② 新增 `shipgroup_clear(mod, ship_id)`：关闭 ⑥-1 或删除船时，精准移除该船在 `libraries/shipgroups.xml` 的 `<select>` 与 `libraries/ships.xml` 的本船条目，返回改动文件列表；编辑保存路径在 `shipgroups.enabled` 为假时调用，删除路径改为复用该 helper（去掉手写正则）。③ 修复 `_shipsxml_sync()` 空组不落盘：原来比较的是已被删除正则改写的 `txt`，导致关闭 ⑥-1 后 `ships.xml` 条目残留在内存视图外；改为比较写入前的 `orig`。④ 清理 `shipgroups.xml`：删除第 3-4 行空壳 `<add sel="//groups/group[@name='UP7_EVE_battleship_xl_01']">` 与 706-710 畸形块（`<add sel=group>` 内套 `<group>`），改为合法 `<group>` 定义；`/api/shipgroups?ship=ship_par_xl_revelation` 实测返回该组（weight=20）。验证：ast 通过、44 项单测全绿（新增 `test_clear_removes_only_this_ship`）、8765 重启后 templates/shipgroups 冒烟通过 |
+| 2026-11-08 | **材质前缀换名同步修正纹理路径**：新增 `_ml_swap_tex_paths()`，克隆或复用目标材质时把材质定义内的 `\旧前缀\` 目录段替换为 `\新前缀\`（大小写不敏感、兼容 `/`），例如 `assets\textures\megathron\r_a.dds` → `assets\textures\revelation\r_a.dds`；旧 collection 原样保留（只增不改）。对旧版本已克隆但路径未改的材质，再次应用前缀时只修路径段、不重命名不删改其它内容。新增 3 项测试（克隆改写、已存在修复、ref 已为新前缀时的修复），全量 38 项通过 |
+| 2026-11-08 | **⑥-1 shipgroup 归属改为所见即所得（读/写/兜底三处修复）**：① 读取 `_shipgroups()` 重写：按 X4 diff 语义先落 `<add sel="//groups"><group>` 组定义、再合并 `<add sel="//groups/group[@name='X']">` 的追加 select，同名组累加且同 macro 后写覆盖权重；属性顺序/引号不再敏感；追加块内历史畸形 `<group>` 不再被误认为新组。实测 `ship_bor_xl_nyx` 归属从 14 组恢复到 21 组、`bor_battleship_xl` 计数 1→7。② 写入 `_sg_strip_ship()` 精准去重：只删本船 macro 的 `<select>`，块内还有别的船就保留，删空才整块移除并清理空壳/畸形 add；组存在性按合并视图判断，正确生成 `add sel=group` 或 `add sel=//groups`。③ 新增模式接入 ⑥-1：`generate` 在 `update_registry` 后调用 `shipgroup_save_all`，并删除 `update_registry` 里无条件写 `UP7_EVE_battleship_{l|xl}_01`（weight=20）的兜底；不勾选启用就不写任何 shipgroup 条目。④ 新增 `_shipsxml_sync()`：仅在 `libraries/ships.xml` 维护 `id == 本船id` 或 `id == 本船id__分组` 的 `<ship group=...>` 条目（多分组时第一个用船 id、其余用 `船id__分组`；category 取 ship 尺寸/派系并合并 jobs 派系），其它船的条目一律不动；删除船时同步清理本船条目。验证：ast 通过、35 项单测全绿（新增 `tests/test_shipgroups.py` 3 项）、8765 重启后 `/api/shipgroups` 冒烟通过 |
+| 2026-11-08 | **修复舰船选项卡底部操作说明残留**：新增 `resetShipResult()`，在切换新增/修改模式、切换模板或舰船、以及每次提交开始时清空 `#status` 与 `#result`；提交前也先清空结果区，失败时不再保留上一次操作的“下一步/说明”，避免两次操作的详细说明叠在一起 |
+| 2026-11-08 | **⑤ 外观与分类新增「舰船尺寸 size」**：① 前端 ⑤ 增加 size 选择（大型 L / 超大型 XL），默认跟随模板，新增模式可改，修改模式只读（不移动已有文件归属）；`collect()`/草稿/清空/回填全链路接入。② 后端 `generate` 支持 `d["size"]`：写入目录 `size_<新尺寸>`、component/macro 的 `class="ship_<尺寸>"` 同步改写、注册表/wares/jobs/loadout 全部按新尺寸；模板源文件仍按模板自身尺寸定位（`src_un`）。③ `geo_rebase()` 增加 `src_size/dst_size`，L 模板生成 XL 船时把几何路径中的 `size_l` 段同步改为 `size_xl`（否则数据已复制到 size_xl、geometry 仍指 size_l → 模型/碰撞失效）。④ `/api/enums` 增加 `size`（l/xl）。验证：ast 通过、32 项单测全绿（新增 `test_geo_rebase_size_change`）、8765 重启后 `/api/enums` 返回 size=l/xl 冒烟通过 |
+| 2026-11-08 | **材质前缀换名 + 模型同步后材质库对齐**：① ⑤-1 删除逐材质「换用新材质名」输入框，改为模块顶部单个「换用新材质前缀」；新名 = 新前缀 + "." + 通用名，`material_tuning.prefix` 随草稿保存/回填。② 后端材质名校验改为「前缀.名称」两段各自 `[A-Za-z0-9_]`，修复 `revelation.evemate_a` 被误判非法的问题；新增 `_ml_rename_ref_addonly()`：目标材质已存在则复用，缺失才克隆定义到新 collection，只改写本船 component 引用，不重命名/删除已有材质、不动其他舰船。③ `ship_model_sync` 覆盖舰船 xml 前记录旧 xml，末尾新增 `align_materials_after_sync()` 只补 material_library.xml 缺失材质（优先用新 xml 第一个已存在材质作克隆数据，全部缺失时用旧 xml 第一个材质），材质库纳入 `_shipmodel_backup`。验证：ast 通过、31 项单测全绿（新增 `tests/test_materials.py` 5 项）、8765 重启后 index/templates/shipmaterials 冒烟通过 |
+| 2026-11-06 | **工程重构收尾（0-7 步）+ 写入可靠性加固**：① 建立 `tests/` + `run_tests.ps1`（26 项 unittest）；② geometry 规则单点化 `geo_owned()/geo_rebase()`；③ 装备字段 `_EQ_FIELDS[cls]` 单一数据源；④ 特效写入收敛 `upsert_effect()/finish_write()`；⑤ HTTP 薄封装 `_json()/_q()/_body()`；⑥ index 注册统一 `register_assets()`；⑦ 写入事务化：`generate`/`equip_generate` 失败按 created 逆序回滚；⑧ 缓存分组失效 `CACHE_GROUPS`。**本轮新增**：`equip_generate` 补 ID 存在性校验（同 class 扫描 + 目标 mod 同名宏/组件磁盘兜底）；`created` 只记录本次新建文件/目录，避免回滚误删用户原有文件；新增 `write_text()` 原子写（同目录临时文件 + `os.replace`，可带备份），替换 macro/component/index/t 四类高频写入；新增 `_txn` 事务装饰器（`_tx_begin/_tx_record/_tx_restore`），覆盖既有文件写前快照，`ok=False` 或异常时恢复 modified、删除 created；清理写盘类静默 `except: pass`（data 复制/改名、配置、缓存、解包复制转告警，只读探测收窄为 `OSError`）；`do_GET` 267 行 elif 链改为 `_GET_EXACT` + `_GET_PREFIX` 路由表（精确优先，行为与顺序不变）；新增 `tests/test_e2e.py`（generate 成功路径、generate→delitem 往返）。验证：26 测试全绿、ast 通过、8765 重启后 templates=250 等接口冒烟通过。备份：`D:\TraeCN backup\EVE_Ship_Builder_workdir` |
 | 2026-10-27 | **dockarea 悬空 geometry 导致玩家上船僵死（实锤修复）**：① dockarea 搜索范围扩大（模板源→原版 assets→全部 extensions/DLC），找不到组件/宏时不改引用不注册（`da_ok` 门控，杜绝悬空注册崩溃）。② dockarea 组件复制改为只改 name、geometry 共享原版数据（不改 `_data` 目录名/归属前缀、不复制数据目录）。③ 船体与装备/弹丸/导弹复制（`_copy_rename_asset`）同模式加固：**先复制数据目录，成功才改写 geometry**，缺失/失败回退共享模板数据并给 warning。统一原则：geometry 永远指向实际存在的数据目录。症状链：模板在 DLC → geometry 指向不存在的新名目录 → `collisionMeshFile handle ... is invalid` → 传送后僵死。教训：崩溃先看 debuglog.txt；**改完 server.py 必须重启服务进程**（旧进程重新生成会覆盖手动修复，导致二次复现） |
 | 2026-10-23 | **方案A：jobs↔shipgroups 接线改造**（正向机制研究归档见 [JOBS_SHIPGROUPS_MECHANISM.md](JOBS_SHIPGROUPS_MECHANISM.md)）。① `libraries/shipgroups.xml` 新增 52 个约定名组：26 个 job 派系 × 需要的尺寸（`{prefix}_battleship_xl` 装 6 艘 XL、`{prefix}_battleship_l` 装 12 艘 L，权重 30/20）；无独立前缀的派系（player/ministry/hatikvah/alliance/fallensplit/criminal）同时建「完整 id」与「猜测短码」两套组名提高命中率。② 与 VRO/XR_ShipPack 同名的 6 个 XL 组（bor/hol/par/spl/tel/tri）改用 `<add sel="//groups/group[@name='...']">` 注入，避免重复定义报错并保留对方战舰；`content.xml` 增加 `ws_1696862840`(VRO)、`xr_shippack` 可选依赖保证加载顺序。③ `libraries/jobs.xml` 135 条 `<select>` 的 tags 由 `[military]` 改为 `[military, battleship]`（military 保留以兼容 buc/ter/spl 系带 military 的组名）。④ 原 `UP7_EVE_battleship_xl_01`/`_l_01` 保留不删（已不可达）。备份：`D:\Games\X4 exout\UP7_Real_EVE_Ships_backup_20261023\`。验证：两侧 XML 校验通过、组名冲突 0、残留 `[military]` select 0 |
 | 2026-10-22 | **⑧⑨ 同组不同尺寸分栏修复**：`g_bot_01` 等组混编 M 盾+L 炮塔时，旧代码只聚合为一个设置栏（无法分别设装备），修复后按「组+尺寸」拆栏。识别逻辑：`connSize()` 取挂载点名中的 `_es-`/`_s-`/`_m-`/`_l-`/`_xl-`/`_exl-`（前置必须是 `_`，交替最长优先），名字无则按 tags 兜底。涉及 `fillLoGroups`（分组键改为 group\|size）、`addLoGroup`/`addMtGroup` 标签显示尺寸、`autoLoadout`/`restoreLoadout` 回拆按尺寸逐条、`mtRows`/`loRows` 服务端零改动（原逐条输出 `<shields/turrets group exact>` 天然兼容同组多条）。实测 megathron：M 盾 4 个 / L 炮塔 1 个各一行，标签如「组:g_bot_01（M · 4个）」「组:g_bot_01（L · 1个）」 |
@@ -281,3 +301,4 @@ EVE_Ship_Builder/
 | 2026-10-17 | 初版。整合本次会话修复：材质竞态、模式切换重构、delitem 路径兼容、孤儿材质清理、新增模式 loadShipgroups 缺失、delItem id 格式修复 |
 | 2026-11-01 | 组件装配上线（模型同步选项卡 /api/componentassemble）：ego 导出 xml+_data → 显式 geometry → container 补丁 → data/.ani 复制 → 剥 _x数字 找原版宏改名 → index 注册 → 图标注册 → 几何存在性校验；Blender 侧简化为纯缩放+导出 |
 | 2026-11-01 | x150 炮塔修复链：① 编辑保存重写 macro identification t 引用（_rewrite_ident_tids 共用，改名重载不生效根因）② 宏 component ref 改正则+断言（原版带空格致静默失配指回原版组件）③ geometry mod 自有数据必须显式 extensions 路径（assets 裸路径 meshsource 拒载根因；_copy_rename_asset 同类隐患归一）④ 图标自动复用源组件贴图（原类默认光束贴图）⑤ 组件流不禁用 .jcs（原版同样激活，ego 导出有效）⑥ tags 同类参考点击 toggle 统一四处 |
+| 2026-11-08 | 材质库写入缩进修复：`_ml_reindent` 改为按标签层级重排（原实现从 `<material>` 截块、首行无缩进导致最小缩进恒为 0，克隆块层级越插越深）；`_ml_insert_material` 新建 collection / 追加材质按行插入（原实现直接拼在 `</collection>`/`</add>` 前，出现 `</collection>\t\t<collection>` 与 closing 标签缩进漂移）；`_ml_set_block_prop` 补插 property 改用 `</properties>` 现有缩进；`merge_material_library` 原有独立拼接逻辑（`</collection></add>` 同行、块缩进沿用模板文件、绕过 `write_text` 备份）统一改为复用 `_ml_insert_collection` + `write_text`。新增 5 项格式单测，43 项全绿；已按同样规则修整现有 material_library.xml 的 revelation 段（仅空白变更，XML 校验通过，备份 `_shipmodel_backup/20261108-130222_ml_indent`） |
