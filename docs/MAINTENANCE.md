@@ -1,7 +1,8 @@
 # EVE_Ship_Builder 工程维护文档
 
-> 最后更新：2026-11-06
-> 适用版本：当前主干（server.py + index.html 单文件架构）
+> 最后更新：2026-11-12
+> 适用版本：当前主干（server.py 8883 行 + index.html 4046 行 单文件架构）
+> 铁律索引：[RULES.md](RULES.md)（规则 → 代码位置，本文档只讲"为什么"与事故过程）
 
 ---
 
@@ -10,13 +11,13 @@
 | 项目 | 值 |
 |---|---|
 | 工程根目录 | `C:\Users\15536\Doubao\chats\2026-10-03\new-chat-1\EVE_Ship_Builder\` |
-| 前端 | `index.html`（单文件，~4000 行，含全部 JS/CSS，原生 ES6） |
-| 后端 | `server.py`（单文件，~8500 行，Python 3.9+ 原生 `http.server`） |
+| 前端 | `index.html`（单文件 4046 行，含全部 JS/CSS，原生 ES6） |
+| 后端 | `server.py`（单文件 8883 行，Python 3.9+ 原生 `http.server`） |
 | 启动方式 | 双击 `启动服务.bat` 或 `python server.py`，浏览器访问 `http://127.0.0.1:8765` |
 | X4 解包根 | `D:\Games\X4 exout` |
 | 当前目标 Mod | `UP7_Real_EVE_Ships` |
-| 持久化文件 | `builder_config.json`（自动保存表单状态，前端不回写） |
-| 备份目录 | `jcs_backup/`（generate/edit 自动备份，delitem 不备份） |
+| 持久化文件 | `builder_config.json`（本机配置：`root` / `target_mod` / `mode` / `backup_root` / `id_suffix`，gitignore 不入库）；表单草稿存浏览器 localStorage（`stashDraft`/`unstashDraft`） |
+| 备份目录 | ① `<mod>\_shipmodel_backup\<时间戳>_<ship_id>\`（舰船生成/编辑/模型同步，同船滚动保留 3 次）；② `backup_root` 配置的 `bak_<tag>_<时间戳>\`（装备/弹丸编辑写前快照，本机指向 `UP7_Real_EVE_Ships_jcs_backup_20261004`，未配置时默认 `<root>\_x4sb_backup`）。`delitem` 不备份 |
 
 ### 架构
 
@@ -42,21 +43,21 @@ D:\Games\X4 exout\          ← 原版库 + extensions\
 
 ### 2.1 舰船选项卡（新增/修改）
 
-| 卡片 | 功能 | 关键函数 |
+| 卡片（按界面顺序） | 功能 | 关键函数 |
 |---|---|---|
-| ① 基础信息 | 船体/质量/惯性/推进/存储 | `fill()`, `collect()` |
-| ② 成本 | 最小/平均/最大成本 + 建造时间 | `loadCostRefs()` |
-| ③ 视觉参考 | 从原版船复制视觉配置 | `showRefs()` |
-| ④ 挂载点 | 武器/炮塔/护盾/引擎挂载 | `loadMounts()`, `renderMounts()` |
-| ⑤ 外观与分类 | 图标/类型/制造商等枚举下拉 | `setSel()` |
-| ⑤-1 材质参数 | material_library.xml 调优 | `loadShipMaterials()`, `renderMaterials()` |
-| ⑥ AI 派系使用 | jobs（派系/任务勾选） | `loadShipJobs()` |
-| ⑥-1 shipgroup 归属 | 加入/新建 shipgroup | `loadShipgroups()`, `addSgRow()` |
-| ⑦ 建造成本 | 价格/时间/建造方式 | `loadCostRefs()` |
-| ⑧ 挂载点 tags | 按组改 component 挂载 tags | `loadMounts()`, `mtRows()` |
-| ⑧-1 macro 连接点 | 编辑 ship macro 的 connections | `loadShipConnections()`, `addMcRow()` |
-| ⑨ 装配预设 | loadout 生成 | `autoLoadout()`, `loRows()` |
-| 软件 | software 槽位行 | `addSwRow()` |
+| ① 操作与来源 | 新增/修改模式、模板或已有船、新 id、中英文名/描述、目标 mod、参考物品 | `modeSwitchEx()`, `onTpl()`, `collect()` |
+| ② 船体与生存 | 尺寸/种族/质量/惯性/推进，船体与护盾量（附原版 L/XL 参考区间） | `fill()`, `collect()`, `apply_props()` |
+| ③ 物理 | drag/inertia 等物理量（留空沿用模板/原值） | `apply_props()` |
+| ④ 货舱 | `cargo max` / `makerrace`（有则替换、缺则插入） | `_storage_apply()` |
+| ⑤ 外观与分类 | 图标/类别/purposetags/舰船尺寸（L/XL）等枚举下拉 | `setSel()`, `vanilla_enums()`, `geo_rebase()` |
+| ⑤-1 材质参数 | material_library 调参 + 前缀换名 + 纹理路径修正 | `loadShipMaterials()`, `renderMaterials()`, `apply_material_tuning()` |
+| ⑥ AI 派系使用 | jobs 派系/任务勾选（添加语法，不覆盖原版） | `loadShipJobs()`, `write_jobs()` |
+| ⑥-1 shipgroup 归属 | 加入/新建 shipgroup（diff 追加语义，同名组合并） | `loadShipgroups()`, `addSgRow()`, `shipgroup_save_all()` |
+| 软件预装 | software 槽位行（总开关） | `addSwRow()`, `_apply_ship_software()` |
+| ⑦ 建造成本 | 价格/建造时间/建造方式（留空按尺寸默认档） | `loadCostRefs()`, `write_ware()` |
+| ⑧ 挂载点 tags | 按组改 component 连接 tags（开关式参考词） | `loadMounts()`, `mtRows()`, `write_mount_tags()` |
+| ⑧-1 macro 连接点 | 编辑 ship macro 的 connections（入口合法性校验） | `loadShipConnections()`, `addMcRow()`, `_apply_macro_connections()` |
+| ⑨ 装配预设 | loadout 生成（勾选启用+留空=清空默认预设） | `autoLoadout()`, `loRows()`, `write_loadout()` |
 
 ### 2.1a 属性写入管线（generate/edit 共用，server.py）
 
@@ -72,7 +73,7 @@ D:\Games\X4 exout\          ← 原版库 + extensions\
 
 ### 2.2 装备选项卡
 
-6 类装备（weapon / shield / engine / thruster / turret / missile），每类独立选项卡，共用 `eq` 前缀函数（`eqOnTpl`, `eqOnPick`, `eqClear` 等）。
+5 类装备共用一套 `cls` 参数化引擎：**炮台 turret / 主武器 weapon / 护盾 shield / 引擎 engine** 为独立选项卡，**弹丸 bullet / 导弹 missile** 是「弹药」选项卡下的两个子页（`EQ_LABEL`）。共用 `eq` 前缀函数（`eqOnTpl`, `eqOnPick`, `eqClear`）；字段读写共用 `_EQ_FIELDS[cls]` 单一数据源（`_read_equip_fields` / `_apply_equip_fields`）。
 
 ### 2.2a macro 连接点（⑧-1，ship macro connections）
 
@@ -220,6 +221,8 @@ modeSwitchEx(key, newMode, clearSels, onApply)
 
 ## 6. 常见坑与注意事项
 
+> 规则全集与代码锚点见 [RULES.md](RULES.md)（R1~R13）；本节只记实现层面的坑。
+
 ### 6.1 ssel 下拉组件
 
 - `sselGet` 返回 `id@@source` 格式，需要 `.split("@@")[0]` 提取纯 id；
@@ -250,14 +253,28 @@ modeSwitchEx(key, newMode, clearSels, onApply)
 
 ```
 EVE_Ship_Builder/
-├── index.html              ← 前端单文件（全部 UI + JS）
-├── server.py               ← 后端单文件（全部 API + X4 解析）
-├── 启动服务.bat             ← 双击启动服务
-├── builder_config.json     ← 表单状态持久化（自动生成）
-├── jcs_backup/             ← generate/edit 自动备份
-├── docs/                   ← 本文档目录
-│   └── MAINTENANCE.md      ← 本文件
-└── *.py                    ← 其他辅助脚本（test_*.py 等）
+├── index.html                 ← 前端单文件（全部 UI + JS，4046 行）
+├── server.py                  ← 后端单文件（全部 API + X4 解析，8883 行）
+├── x4_lookup.py               ← t 文本/名称解析（X4Lookup）
+├── 启动服务.bat                ← 双击启动（python server.py :8765）
+├── builder_config.json        ← 本机配置（root / target_mod / id_suffix，gitignore）
+├── run_tests.ps1              ← 测试入口（unittest + ast）
+├── build_release.ps1          ← 发布打包（白名单 4 文件 → dist/）
+├── backup_workdir_to_D.ps1    ← 工作目录镜像备份（gitignore）
+├── _shipmodel_backup/         ← 生成/编辑自动备份（滚动 3 次）
+├── cache/                     ← 扫描缓存（gitignore）
+├── tests/                     ← 主测试套件（10 文件 / 45 项）
+├── docs/
+│   ├── MAINTENANCE.md         ← 本文件（架构 + 模块 + 事故日志）
+│   ├── RULES.md               ← 铁律索引（规则 → 代码位置）
+│   ├── JOBS_SHIPGROUPS_MECHANISM.md
+│   ├── BLENDER_组件缩放导出需求.md
+│   ├── 项目总结与优化报告_2026-11-06.md
+│   └── archive/               ← 历史文档（2026-10-12 交接文档等）
+├── release/                   ← 发布包内文本模板（使用说明.txt）
+├── tools/                     ← 历史一次性脚本（scan_* / _* 调试补丁）
+├── x4_wp_export.py            ← waypoint 导出旧脚本（已不维护）
+└── *_test.py                  ← 根目录旧回归脚本（build/jobs/loadout/edit）
 ```
 
 ---
@@ -279,6 +296,7 @@ EVE_Ship_Builder/
 
 | 日期 | 内容 |
 |---|---|
+| 2026-11-12 | **文档体系三分工 + 一致性收口（无代码改动）**：① 新建 [RULES.md](RULES.md)（R1~R13 铁律 → 代码位置 + 验证清单）；② README 修正行数（server.py 8883 / index.html 4046）、补充完整目录树、重写选项卡表（补引擎/解包/Diff）、接口速查改为按域分组（GET 51 / POST 23）、测试表补 `tests/` 10 文件、待办只留 POST 路由化/前端收敛/拆模块；③ 本文件修正「最后更新」、§1 持久化与备份路径（`builder_config` 实际字段、`_shipmodel_backup\`）、§2.1 卡片表按真实 UI 顺序重写（①~⑨ + 软件 + ⑥-1/⑤-1/⑧-1）、§2.2 装备改为「5 选项卡 + 弹药两子页」、§7 文件清单重写；④ 交接文档（2026-10-12）降级归档至 `docs/archive/`，标题去掉「唯一基准」并加过时提示 |
 | 2026-11-08 | **revelation 建造界面点炮塔崩溃定位（原版 UI 兼容缓冲越界，用户实测修复）**：现象=点 `ship_par_xl_revelation` 炮塔槽直接崩、无 Lua 报错，minidump 落在 `lua51_64.dll` 且为写 `0x2EF10A11` / 读 `0x23` 等随机地址。根因=原版 `ui/addons/ego_detailmonitor/menu_ship_configuration.lua` 的 `setupGroupData()`（约 11300-11325 行）按升级组数 `n` 分配 `EquipmentCompatibilityInfo[?]` 缓冲、却按兼容标签数 `n_comp` 调 `C.GetUpgradeGroupCompatibilities()` 写入，`n_comp > n` 时堆越界（LuaJIT 内存损坏 → 随机地址 AV）。本例炮塔连接 tags 含 `standard advanced highpower missile boron` 共 5 个兼容标签，而全船只 3 个组（eng_g_01/left_g_01/right_g_01）→ 5 > 3。**用户删掉 3 个 tags 后 n_comp=2 < 3，崩溃消失，确认根因**。同时核查并排除：放大炮塔 `turret_par_l_plasma_01_mk1_x150` 与原版逐字段一致且 `large` 标签不进 `extralarge` 槽；舰船 xml 无 `<mesh>` 属正常（naglfar 同构）。已在 §4.3 补充铁律：**任一连接的兼容标签数必须严格小于该船升级组数**；同船 `has only turrets in group 'X'!` / `has no shields in engine group 'X'!` @Artists 警告可作结构预警 |
 | 2026-11-08 | **恢复被误删的 EVE 命名 shipgroup（右键生成表单 L/XL 消失）**：根因是 ⑥-1 关闭清理时 `_sg_strip_ship()` 把 `UP7_EVE_battleship_xl_01` 里最后一个 `<select>`（revelation）删掉后，`_sg_clean_empty()` 认为组已空而整块删除；`UP7_EVE_battleship_l_01` 在更早的清理中已丢失。而 `libraries/ships.xml` 的 `UP7_EVE_battleship_xl` / `UP7_EVE_battleship_l` 条目按名引用这两个组，组不存在 → 船定义失效 → 右键生成表单（`UP7_Right_Menu` 的 `get_ship_definition`）里 EVE L/XL 舰船整体消失。修复：① `shipgroups.xml` 末尾恢复两组定义（XL 6 艘：nyx/avatar/hel/naglfar/phoenix/revenant；L 12 艘：megathron/sin/legion/paladin/providence/tempest/tornado/typhoon/corax/drake/raven/vedmak，权重沿用 30/20）；revelation、avatar_s 已有独立 ships.xml 条目，不再放进该组以免重复。② `server.py` 新增 `_SG_RESERVED_GROUPS`，`_sg_strip_ship()` 对这两个命名组只清 `<select>`、保留组外壳，杜绝再次整组删除。验证：`ElementTree` 解析通过、`_shipgroups()` 读到 XL=6/L=12（共 492 组）、ast 通过、45 项单测全绿（新增 `test_clear_keeps_reserved_eve_group`）、8765 重启后 `/api/templates` 200。**改完需 Vortex Deploy 并重启游戏才生效** |
 | 2026-11-08 | **⑥-1 关闭即清理 + 旧接口删除 + shipgroups 脏数据清理**：① 删除失效的 `POST /api/shipgroup/save` 路由、白名单与 `shipgroup_save()` 整个函数（前端已无调用，逻辑并入整船保存）。② 新增 `shipgroup_clear(mod, ship_id)`：关闭 ⑥-1 或删除船时，精准移除该船在 `libraries/shipgroups.xml` 的 `<select>` 与 `libraries/ships.xml` 的本船条目，返回改动文件列表；编辑保存路径在 `shipgroups.enabled` 为假时调用，删除路径改为复用该 helper（去掉手写正则）。③ 修复 `_shipsxml_sync()` 空组不落盘：原来比较的是已被删除正则改写的 `txt`，导致关闭 ⑥-1 后 `ships.xml` 条目残留在内存视图外；改为比较写入前的 `orig`。④ 清理 `shipgroups.xml`：删除第 3-4 行空壳 `<add sel="//groups/group[@name='UP7_EVE_battleship_xl_01']">` 与 706-710 畸形块（`<add sel=group>` 内套 `<group>`），改为合法 `<group>` 定义；`/api/shipgroups?ship=ship_par_xl_revelation` 实测返回该组（weight=20）。验证：ast 通过、44 项单测全绿（新增 `test_clear_removes_only_this_ship`）、8765 重启后 templates/shipgroups 冒烟通过 |

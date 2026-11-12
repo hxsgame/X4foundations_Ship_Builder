@@ -47,13 +47,26 @@ Start-Sleep 8 → 再查 8765 监听确认
 
 ```
 EVE_Ship_Builder/
-├─ server.py         后端主程序（路由 + 舰船/装备生成逻辑，约 2600 行）
-├─ index.html        前端单页（选项卡界面，约 1700 行）
-├─ x4_lookup.py      X4 数据提取/名称解析/文本清洗（独立可复用，X4Lookup 类）
-├─ builder_config.json  目标 mod 记忆
-├─ README.md         本文档
-├─ *_test.py         回归测试脚本（build/jobs/loadout/edit）
-└─ tools/            历史一次性脚本归档（scan_* 数据提取、_* 调试/补丁脚本）
+├─ server.py              后端主程序（路由 + 舰船/装备/特效生成，8883 行）
+├─ index.html             前端单页（10 个选项卡，4046 行）
+├─ x4_lookup.py           X4 文本/名称解析（X4Lookup 类，210 行）
+├─ 启动服务.bat            双击启动（python server.py，端口 8765）
+├─ builder_config.json    本机配置（root / target_mod / mode / backup_root / id_suffix，gitignore）
+├─ run_tests.ps1          测试入口（unittest + ast 校验）
+├─ build_release.ps1      发布打包（白名单 4 文件 → dist/*.zip）
+├─ backup_workdir_to_D.ps1 工作目录镜像备份（robocopy /MIR → D:\TraeCN backup）
+├─ release/               发布包文本模板（使用说明.txt）
+├─ tests/                 主测试套件（10 个文件 / 45 项）
+├─ docs/                  文档
+│   ├─ MAINTENANCE.md     维护文档（架构、模块、事故日志）
+│   ├─ RULES.md           铁律索引（规则 → 代码位置）
+│   ├─ JOBS_SHIPGROUPS_MECHANISM.md
+│   ├─ BLENDER_组件缩放导出需求.md
+│   ├─ 项目总结与优化报告_2026-11-06.md
+│   └─ archive/           历史文档（含 2026-10-12 交接文档）
+├─ tools/                 历史一次性脚本（scan_*、_* 调试/补丁）
+├─ x4_wp_export.py        waypoint 导出旧脚本（已不维护，统一走 Blender 插件面板）
+└─ *_test.py              根目录旧回归脚本（build/jobs/loadout/edit）
 ```
 
 `scan_*.py`、`_*.py` 均为历史一次性脚本，与运行时无关，可归档到 `tools/`（见"优化建议"）。
@@ -83,13 +96,16 @@ EVE_Ship_Builder/
 
 | 选项卡 | 说明 |
 |---|---|
-| 舰船模块 | 模板选择、新增/修改、属性（名称/种族/尺寸/标识）、护盾/引擎等 |
+| 舰船模块 ship | 模板选择、新增/修改、①~⑨ 全部属性（操作来源、船体生存、物理、货舱、外观分类、材质、jobs、shipgroup、软件、成本、挂载 tags、macro 连接点、装配预设） |
 | 炮台 turret | 新增/修改、tags、引用链、弹药宏（bullet class 输入筛选） |
 | 主武器 weapon | 同上 |
-| 护盾 shield | 同上 |
-| 弹药 ammo | 子选项卡：**弹丸 bullet** / **导弹 missile** |
-| 模型同步 | EGO Blender 导出目录 → 目标 mod：py 处理舰船 xml、macro 连接点归位、模型目录/ani/dae 覆盖、moding 可覆盖结构 |
-| Dock 复用 | 原版/DLC dock 组件复制改名注册新 id + 用 Blender 导出的 waypoint xml 替换停靠路径（几何沿用原版） |
+| 护盾 shield | 新增/修改、tags、引用链、护盾视觉（材质/动画部件） |
+| 引擎 engine | 新增/修改、tags、引用链 |
+| 弹药 ammo | 子选项卡：**弹丸 bullet**（数值/特效/视觉） / **导弹 missile**（尾焰/爆炸/发射塔引用） |
+| Dock 复用 dockclone | 原版/DLC dock 组件复制改名注册新 id + 用 Blender 导出的 waypoint xml 替换停靠路径（几何沿用原版） |
+| 模型同步 modelimport | EGO Blender 导出目录 → 目标 mod：py 处理舰船 xml、macro 连接点归位、模型目录/ani/dae 覆盖、moding 可覆盖结构；**组件装配**（缩放复用 ego 导出，不跑 py） |
+| 解包 unpack | XRCatTool 解包基游戏 / DLC / mod（三路来源，轻量/完整模式） |
+| Diff 工具 difftool | diff 校验、预览、XSD 枚举、合并结果 |
 
 ### 舰船模块子模块
 
@@ -103,6 +119,8 @@ EVE_Ship_Builder/
 ---
 
 ## 五、游戏规则要点备忘（铁律）
+
+> 完整版（含代码位置与校验点）见 [docs/RULES.md](docs/RULES.md)；本节只列用户最常踩的几条。
 
 1. **只认游戏 XML 结构规则，不认命名软规律**：
    - 挂载点 id = `<connection>` 的 `name` 属性；分组 = `group` 属性。
@@ -126,15 +144,23 @@ EVE_Ship_Builder/
 
 ## 六、后端接口速查（server.py 路由）
 
-**GET**（读）：
-`/api/templates` 舰船模板列表 · `/api/stats` 原版属性参考 · `/api/enums` 枚举 · `/api/factions` 派系+任务类型 · `/api/costrefs` 建造成本/材料 · `/api/component?ship=` 挂载点 · `/api/shiploadout?ship=` 预设 · `/api/shipjobs?ship=` jobs · `/api/loadoutmacros` 可选装备宏 · `/api/softwarelist` 软件 · `/api/shipsoftware?ship=` · `/api/equipkinds?cls=` · `/api/equiptemplates?cls=` · `/api/equipread?cls=&id=` · `/api/equiptags?cls=` · `/api/equiprefs` 装备参考 · `/api/equipchain?cls=&id=` 引用链 · `/api/moddirs` mod 目录 · `/api/config`
+路由定义集中在 `_GET_EXACT` / `_GET_PREFIX`（server.py ~L8337）与 `do_POST` 白名单（~L8433）。当前 **GET 51 条**（13 精确 + 38 前缀）、**POST 23 条**。
 
-**POST**（写）：
-`/api/generate` 舰船新增 · `/api/edit` 舰船修改 · `/api/equipgenerate` / `/api/equipedit` 装备新增/修改 · `/api/bulletgenerate` / `/api/bulletedit` 弹丸新增/修改 · `/api/config` · `/api/pickdir`（系统文件夹选择对话框） · `/api/dirtree` 浏览器内目录树（`files:true` 时附带文件列表） · `/api/shipmodelsync` 船模同步（入参 `ship_id / export_root / py_path / mod / overlay`；`overlay` 留空 = `<mod>\moding`） · `/api/dockclone` dock 复用生成（入参 `tpl / new_id / wp_xml / mod / overlay`；`wp_xml` 留空 = 保留模板原 waypoint）
+**舰船（GET）**：`templates` · `stats` · `enums` · `factions` · `costrefs` · `component?ship=` · `shiploadout` · `shipjobs` · `shipconnections` · `shipgroups?ship=` · `shipgroups/all` · `shipmaterials` · `shipsoftware` · `softwarelist` · `loadoutmacros`
+**舰船（POST）**：`generate` · `edit` · `delitem`
 
-**GET 补充**：`/api/docklist` dock 复用模板列表（原版/DLC/mod 全部 dock 类组件，含 class/waypoint 数/来源/宏是否存在） · `/api/unpackscan?game=` 扫描游戏目录的 cat 来源 · `/api/unpackstatus` 解包任务状态
+**装备（GET）**：`equipkinds` · `equiptemplates` · `equipread` · `equiptags` · `equiprefs` · `equipnumrefs` · `equipchain` · `eqgeom` · `shieldmatrefs`
+**装备（POST）**：`equipgenerate` · `equipedit`
 
-**POST 补充**：`/api/unpack` 启动解包（入参 `game / out / xtool / mode / sources`，后台线程） · `/api/unpackcancel` 取消解包
+**弹药 / 特效（GET）**：`bulletrefs` · `bulleteffectlist|read` · `bullettraillist|read` · `bulletbeamlist|read` · `bulletvislist|read|refs` · `missileusers` · `missiletags` · `trailrefs` · `trailmaterials` · `traileffect` · `explosionrefs` · `explosioneffects` · `explosionusers`
+**弹药 / 特效（POST）**：`bulletgenerate` · `bulletedit` · `bulleteffectbuild` · `bullettrailbuild` · `bulletbeambuild` · `bulletvisbuild` · `explosionbuild` · `trailnew`
+
+**资产复用（POST）**：`shipmodelsync`（入参 `ship_id / export_root / py_path / mod / overlay`，`overlay` 留空 = `<mod>\moding`） · `componentassemble` · `dockclone`（入参 `tpl / new_id / wp_xml / mod / overlay`）；模板列表 `docklist`（GET）
+**解包（GET）**：`unpackscan?game=` · `unpackstatus`；（POST）`unpack`（入参 `game / out / xtool / mode / sources`，后台线程） · `unpackcancel`
+**Diff（GET）**：`difflist` · `diffpreview` · `diffvalidate` · `schemas`；（POST）`diffvalidate`
+**基础设施**：`config`（GET/POST） · `moddirs` · `dirtree`（`files:true` 附文件列表） · `pickdir` · `refresh`
+
+> 入参与返回结构的权威说明见 `docs/MAINTENANCE.md` 第 2 章；规则与铁律索引见 `docs/RULES.md`。
 
 ### 游戏解包细节（2026-10-24）
 
@@ -223,27 +249,40 @@ EVE_Ship_Builder/
 
 ## 七、测试脚本（回归用）
 
-| 脚本 | 用途 |
-|---|---|
-| `build_test.py` | 舰船新增生成链路 |
-| `jobs_test.py` | jobs 生成回归 |
-| `test_edit.py` | 舰船修改回归 |
-| `test_loadout.py` | 装配预设写入回归 |
+**主测试套件 `tests/`（unittest，45 项）**：`.\run_tests.ps1` 或 `python -m unittest discover -s tests -v`
 
-`scan_*.py`：派系/枚举/材料/存储/图标/loadout 等一次性提取，留作溯源与复用参考。
+| 文件 | 覆盖 |
+|---|---|
+| `test_geometry.py` | geometry 归属/改写（`geo_owned` / `geo_rebase`） |
+| `test_equip_fields.py` | 装备字段读写往返 |
+| `test_registry.py` | index 注册统一 |
+| `test_transaction.py` | 写入事务/回滚 |
+| `test_cache_groups.py` | 缓存分组失效 |
+| `test_shipgroups.py` | shipgroups diff 读取 / 精准清理 / 保留组 |
+| `test_materials.py` | 材质克隆与纹理路径改写 |
+| `test_effects.py` | 特效写入收敛 |
+| `test_e2e.py` | generate 成功路径 + generate→delitem 往返 |
+| `test_assemble_smoke.py` | 组件装配冒烟 |
+
+**根目录旧脚本（历史回归，未纳入 runner）**：`build_test.py`（舰船新增）、`jobs_test.py`（jobs）、`test_edit.py`（舰船修改）、`test_loadout.py`（装配预设）。
+
+`tools/` 下的 `scan_*.py`、`_*.py` 为一次性提取/调试脚本，留作溯源，不参与运行。
 
 ---
 
 ## 八、优化建议（待办）
 
 **已落地**：
-- ✅ 扫描缓存刷新：顶部"刷新数据"按钮 + `/api/refresh` 清空 `_EQ_SCAN_CACHE/_LOADOUT_CACHE/_GLOBAL_ASSETS`，运行中往 mod 加物品后无需重启服务即可看到。
-- ✅ 模型引用完整性抽查：`verify_model_refs()` 在舰船/装备/弹丸生成后只读校验 component 几何引用是否在目标 mod 或原版 ROOT 中存在，缺失以黄色 warnings 展示（不阻断写入）。
+- ✅ 扫描缓存刷新：顶部"刷新数据"按钮 + `/api/refresh` → `refresh_caches()`，运行中往 mod 加物品后无需重启服务。
+- ✅ 模型引用完整性抽查：`verify_model_refs()` 在生成后只读校验几何引用，缺失以黄色 warnings 展示（不阻断）。
 - ✅ 历史脚本归档：`scan_*.py`、`_*.py` 移到 `tools/`。
+- ✅ 2026-11-06 重构 0~7 步：geometry 单点化（`geo_owned/geo_rebase`）、`_EQ_FIELDS` 单一数据源、`upsert_effect/finish_write` 收敛、`_json/_q/_body` + **GET 路由表**、`register_assets` 统一注册、`_txn` 写入事务化、`CACHE_GROUPS` 缓存分组、`tests/` + `run_tests.ps1`。
+- ✅ 端口占用提示：服务启动已内置（占用时直接打开页面）。
 
 **保留待办**：
-1. **路由可维护性**：do_GET/do_POST 是长 if/elif 链（30+ 分支）。本地工具可用，但可改路由表/装饰器，并把每分支内联的 `urlparse` 提到函数顶部。
-2. **端口占用提示**：8765 被占时启动会静默失败，main 里可加端口检测与提示。
+1. **POST 路由表化**：`do_POST` 仍是「白名单 + elif 链」（新增接口要改两处，易漏），GET 侧已完成。
+2. **前端收敛**：80 处裸 `fetch` 无统一 `api()`；`esc/escHtml`、状态提示 4 套、目录选择 3 套并存。
+3. **P2 拆模块**：`server.py` 已 8883 行，建议功能冻结窗口拆为 `http_app / assets / xmlpatch / ship / equip / effects / dock / cache`（接口契约不变，前端零改动）。
 
 ---
 
