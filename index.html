@@ -275,14 +275,23 @@
       <div><label>机密等级 secrecy</label>
         <div class="ssel" id="secrecy"></div><div class="rv" id="rv-secrecy"></div></div>
     </div>
+    <div class="grid3" style="margin-top:10px">
+      <div><label>舰船尺寸 size（决定文件归属 size_l / size_xl 与 class）</label>
+        <div class="ssel" id="size"></div><div class="rv" id="rv-size"></div></div>
+    </div>
   </div>
 
   <div class="card">
     <h2>⑤-1 材质参数（material_library.xml，调整船体着色）</h2>
     <label class="sw green"><input type="checkbox" id="ml_enable"> 启用：调整本船材质参数（不启用则材质库保持原样）</label>
+    <div class="sub-inline" style="display:flex;align-items:center;gap:8px;margin:8px 0 4px;flex-wrap:wrap">
+      <label style="margin:0;white-space:nowrap"><b>换用新材质前缀</b></label>
+      <input id="ml_prefix" placeholder="留空=沿用原名" style="width:220px">
+      <span style="color:#8b949e;font-size:11px">新名 = 新前缀 + "." + 通用名（如 evemate_a）。材质库已有同名定义直接复用，没有才新增；只改本船引用，不动其他舰船。</span>
+    </div>
     <div class="hint" style="display:block;margin:6px 0 4px">读取本船 component 中 <code>&lt;material ref="collection.material"/&gt;</code> 引用的材质，列出材质库（material_library.xml）里各参数当前值（输入框占位符），填新值即覆盖：
       本 mod 自带材质直接改 <code>extensions\&lt;mod&gt;\libraries\material_library.xml</code>；原版/其他 mod 的材质在该文件用 diff <code>&lt;replace …/@value&gt;</code> 覆盖（不改游戏本体）。
-      <b>换用新材质名</b>：<b>修改模式</b>=就地重命名材质定义，本 mod 内所有引用一并更新（共用船一起变）；<b>新增模式</b>=克隆为独立副本，仅新船换用，不动原材质。参数调整始终作用于改名后的最终名字。所有栏留空 = 不改；只影响外观，不影响任何战斗数值。</div>
+      前缀栏留空 = 不改名；参数调整作用于前缀换名后的最终材质。所有栏留空 = 不改；只影响外观，不影响任何战斗数值。</div>
     <div id="ml_list"></div>
   </div>
 
@@ -299,9 +308,10 @@
 
   <div class="card">
     <h2>⑥-1 shipgroup 归属（舰船分组，AI 调度候选）</h2>
-    <label class="sw green"><input type="checkbox" id="sg_enable"> 启用：为这艘船指定 AI 调度候选分组（不启用则沿用现有 shipgroups，不加新条目）</label>
+    <label class="sw green"><input type="checkbox" id="sg_enable"> 启用：为这艘船指定 AI 调度候选分组（不启用则不写入任何 shipgroup 条目）</label>
     <div class="hint">shipgroup 决定该船会被哪些派系的 AI 通过 <code>&lt;select&gt;</code> 调度选中：jobs 只声明"某派系某尺寸需要船"，具体由 shipgroups 的分组 + 权重加权随机挑选。
-      启用后按下方分组列表写入目标 mod 的 <code>shipgroups.xml</code>：分组名已存在 → 在该 <code>&lt;group name="X"&gt;</code> 下新增该船的 &lt;select&gt; 引用；不存在 → 新建该 &lt;group&gt;。一艘船可加入多个分组（与整船一并保存）。</div>
+      启用后按下方分组列表写入目标 mod 的 <code>shipgroups.xml</code>：分组名已存在 → 在该分组下追加该船的 &lt;select&gt;；不存在 → 新建该分组。一艘船可加入多个分组（与整船一并保存）。
+      同时只按本船 id 维护 <code>ships.xml</code> 中对应的 <code>&lt;ship group="..."&gt;</code> 选择条目，不改动其他船的条目。</div>
     <div class="blocklabel">目标分组（可多个，默认=当前已属分组）</div>
     <div id="sg_groups"></div>
     <button class="btn-browse" type="button" onclick="addSgRow('')">+ 加分组</button>
@@ -652,7 +662,7 @@ function setSel(id, val){
 async function loadEnums(){
   try { ENUMS = await (await fetch("/api/enums")).json(); }
   catch(e){ ENUMS = {}; }
-  for (const k of ["icon","type","makerrace","purpose","thruster","secrecy"]){
+  for (const k of ["icon","type","makerrace","purpose","thruster","secrecy","size"]){
     ssel(document.getElementById(k), ENUMS[k]||[], null);
   }
 }
@@ -1351,6 +1361,12 @@ function modeSwitchEx(cfg){
   if (cfg.onApply) cfg.onApply(m, changed);
   return m;
 }
+function resetShipResult(){
+  // 切换操作（新增/修改）、切换模板/舰船或开始新提交时，清掉上一次操作的状态与详细说明，
+  // 避免两次操作的“说明/下一步”叠加在一起
+  const st = document.getElementById("status"); if (st) st.innerHTML = "";
+  const rs = document.getElementById("result"); if (rs) rs.innerHTML = "";
+}
 function onMode(){
   modeSwitchEx({
     key: "mode",
@@ -1358,6 +1374,7 @@ function onMode(){
     clearSels: [document.getElementById("template"), document.getElementById("pick")],
     onApply(m, changed){
       MODE = m;
+      resetShipResult();
       const n = m === "new";
       document.getElementById("src_new").style.display = n ? "" : "none";
       document.getElementById("src_edit").style.display = n ? "none" : "";
@@ -1365,6 +1382,9 @@ function onMode(){
       const go = document.getElementById("go");
       go.textContent = n ? "生成并写入 mod" : "保存修改到已有舰船";
       go.className = n ? "btn" : "btn edit";
+      // 修改模式不支持移动文件归属，尺寸只读显示；新增模式可自由改 L/XL
+      const sz = document.getElementById("size");
+      if (sz){ sz.style.pointerEvents = n ? "" : "none"; sz.style.opacity = n ? "1" : ".55"; }
       if (n) onTpl(); else onPick();
     }
   });
@@ -1384,6 +1404,7 @@ function fill(t){
   set("cargo",p.cargo);
   setSel("icon", p.icon); setSel("type", p.type); setSel("makerrace", p.makerrace);
   setSel("purpose", p.purpose); setSel("thruster", p.thruster); setSel("secrecy", p.secrecy);
+  setSel("size", t.size);
   fillCost(p);
 }
 function fillCost(p){
@@ -1398,6 +1419,7 @@ function onTpl(){
   // 选项 value 为 id@@source：先精确匹配（[重复] 按来源），失败回退裸 id（兼容旧持久化值）
   const _sv = sselGet(document.getElementById("template")) || "";
   const t = TP.find(x=>x.id+"@@"+(x.source||"")===_sv) || TP.find(x=>x.id===_sv);
+  resetShipResult();
   if(!t){ clearShip(); return; }
   // 新增模式：目标 mod 恢复为用户自选目录（修改模式 onPick 会跟随所选船改写本框，不能把模板来源带进新增）
   resetJobsUI();
@@ -1431,6 +1453,7 @@ function onPick(){
   // 选项 value 为 id@@source：先精确匹配（[重复] 按来源），失败回退裸 id（兼容旧持久化值）
   const _sv = sselGet(document.getElementById("pick")) || "";
   const t = TP.find(x=>x.id+"@@"+(x.source||"")===_sv) || TP.find(x=>x.id===_sv);
+  resetShipResult();
   if(!t){ clearShip(); return; }
   // 修改模式：目标 mod 跟随所选船所属用户 mod（原版/DLC 船不可作为生成目标，不覆盖用户已选目录）
   resetJobsUI();
@@ -1464,7 +1487,7 @@ function clearShip(){
    "st_missile","st_unit","st_deploy","st_ctr","cargo","cost_min","cost_avg","cost_max","cost_time",
    "new_id","name_zh","name_en","desc_zh","desc_en"]
    .forEach(i=>{const e=document.getElementById(i); if(e) e.value="";});
-  ["icon","type","makerrace","purpose","thruster","secrecy"].forEach(i=>setSel(i,""));
+  ["icon","type","makerrace","purpose","thruster","secrecy","size"].forEach(i=>setSel(i,""));
   ["hull","people","mass","cargo","expl_value","expl_shield","in_pitch","in_yaw","in_roll",
    "dr_forward","dr_reverse","dr_horizontal","dr_vertical","dr_pitch","dr_yaw","dr_roll",
    "st_missile","st_unit","st_deploy","st_ctr","cost_min","cost_max","cost_avg","cost_time"]
@@ -2102,6 +2125,13 @@ function renderMaterials(pending){
   const en = document.getElementById("ml_enable");
   if(en) en.checked = !!(pending && pending.enabled);
   const mats = (ML_DATA && ML_DATA.materials) || [];
+  const pfxEl = document.getElementById("ml_prefix");
+  if(pfxEl){
+    // 前缀回填：草稿/已保存值优先；占位符显示当前公共前缀，便于用户知道改什么
+    pfxEl.value = (pending && pending.prefix) || "";
+    const pres = Array.from(new Set(mats.map(m=>(m.ref||"").split(".")[0]).filter(Boolean)));
+    pfxEl.placeholder = pres.length===1 ? (pres[0]+"（当前前缀，留空=不改）") : "留空=沿用原名";
+  }
   if(!mats.length){ box.innerHTML = '<span style="color:#b86565">⚠ 未读取到该船 component 的材质引用</span>'; return; }
   box.innerHTML = "";
   const pv = (pending && pending.values) || {};
@@ -2117,19 +2147,6 @@ function renderMaterials(pending){
     head.style.margin = "0 0 6px";
     head.innerHTML = '材质 <b style="color:#7fd0ff">'+m.ref+'</b> <span class="sub-inline">shader '+(m.shader||"")+' · 混合 '+(m.blendmode||"")+' · 定义于：'+(m.source||"?")+'</span>';
     div.appendChild(head);
-    const matName = m.ref.split(".")[1] || m.ref;
-    const savedRename = (pv[m.ref] && pv[m.ref].rename) || "";
-    const isEdit = (document.getElementById("mode")||{}).value === "edit";
-    const rnTip = isEdit
-      ? "修改模式：就地重命名材质定义，本 mod 内所有引用该材质的 XML 一并更新（其他共用船一起变）"
-      : "新增模式：克隆为独立副本，仅本船换用，参数调整作用于副本；不动原材质与其他船";
-    const rn = document.createElement("div");
-    rn.style.cssText = "display:flex;align-items:center;gap:8px;margin:0 0 6px;flex-wrap:wrap";
-    rn.innerHTML = '<label style="margin:0;white-space:nowrap">换用新材质名</label>'
-      + '<input class="ml-ren" data-ref="'+m.ref+'" placeholder="'+matName+'（留空=沿用原名）" style="width:230px">'
-      + '<span style="color:#8b949e;font-size:11px">'+rnTip+'</span>';
-    rn.querySelector("input").value = savedRename;
-    div.appendChild(rn);
     if(!m.params || !m.params.length){
       div.innerHTML += '<span style="color:#8b949e;font-size:11px">（该材质没有可调的常用外观参数）</span>';
     } else {
@@ -2151,18 +2168,23 @@ function renderMaterials(pending){
   });
 }
 function mlValues(){
-  // 收集非空改名与参数：{ref: {rename: str, params: {prop: value}}}
+  // 收集参数，并按顶部前缀自动生成每个材质的新全名：{ref: {rename: 前缀.通用名, params: {...}}}
   const out = {};
   const slot = r => (out[r] = out[r] || {rename: "", params: {}});
-  document.querySelectorAll("#ml_list .ml-ren").forEach(inp=>{
-    const v = inp.value.trim();
-    if(v) slot(inp.dataset.ref).rename = v;
-  });
   document.querySelectorAll("#ml_list .ml-val").forEach(inp=>{
     const v = inp.value.trim();
     if(!v) return;
     slot(inp.dataset.ref).params[inp.dataset.prop] = v;
   });
+  const pe = document.getElementById("ml_prefix");
+  const prefix = pe ? pe.value.trim() : "";
+  if(prefix){
+    ((ML_DATA && ML_DATA.materials) || []).forEach(m=>{
+      const parts = (m.ref||"").split(".");
+      if(parts.length < 2) return;
+      slot(m.ref).rename = prefix + "." + parts[1];
+    });
+  }
   return out;
 }
 function clearMaterials(){
@@ -2170,6 +2192,7 @@ function clearMaterials(){
   ML_DATA = null; ML_PENDING = null;
   const box = document.getElementById("ml_list"); if(box) box.innerHTML = "";
   const en = document.getElementById("ml_enable"); if(en) en.checked = false;
+  const pe = document.getElementById("ml_prefix"); if(pe) pe.value = "";
 }
 function restoreMaterials(mt){
   if(!mt) return;
@@ -2435,6 +2458,7 @@ function collect(){
     purpose: sselGet(document.getElementById("purpose")),
     thruster: sselGet(document.getElementById("thruster")),
     secrecy: sselGet(document.getElementById("secrecy")),
+    size: sselGet(document.getElementById("size")),
     jobs: {
       enabled: document.getElementById("jobs_enable").checked,
       factions: Array.from(document.querySelectorAll("#factions input:checked")).map(x=>x.value),
@@ -2477,6 +2501,8 @@ function collect(){
     mount_tags: document.getElementById("mt_enable").checked ? mtRows() : [],
     material_tuning: {
       enabled: document.getElementById("ml_enable").checked,
+      prefix: document.getElementById("ml_enable").checked
+        ? (document.getElementById("ml_prefix").value || "").trim() : "",
       values: document.getElementById("ml_enable").checked ? mlValues() : {},
     },
     macro_connections: {
@@ -2529,7 +2555,7 @@ function restoreFields(d){
   const in_=(d.inertia||"").split("/"); set("in_pitch",in_[0]||""); set("in_yaw",in_[1]||""); set("in_roll",in_[2]||"");
   const dr=(d.drag||"").split("/"); ["forward","reverse","horizontal","vertical","pitch","yaw","roll"].forEach((k,i)=>set("dr_"+k, dr[i]||""));
   const st=(d.storage||"").split("/"); set("st_missile",st[0]||""); set("st_unit",st[1]||""); set("st_deploy",st[2]||""); set("st_ctr",st[3]||"");
-  [["icon",d.icon],["type",d.type],["makerrace",d.makerrace],["purpose",d.purpose],["thruster",d.thruster],["secrecy",d.secrecy]].forEach(([k,v])=>{ if(v) setSel(k,v); });
+  [["icon",d.icon],["type",d.type],["makerrace",d.makerrace],["purpose",d.purpose],["thruster",d.thruster],["secrecy",d.secrecy],["size",d.size]].forEach(([k,v])=>{ if(v) setSel(k,v); });
 }
 function restoreCost(c){
   if(!c) return;
@@ -2578,6 +2604,7 @@ async function doSave(){
   stashDraft(true);                       // 提交前自动暂存，防止保存失败/误操作丢数据
   const btn = document.getElementById("go"); btn.disabled = true;
   const st = document.getElementById("status"); st.innerHTML = MODE==="new" ? "生成中…" : "保存中…";
+  const rs = document.getElementById("result"); if (rs) rs.innerHTML = "";   // 新提交先清掉上次操作的详细说明
   const base = collect();
   const body = MODE==="new"
     ? { template: (sselGet(document.getElementById("template"))||"").split("@@")[0],

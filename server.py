@@ -8,7 +8,7 @@ t 名称、index 注册），直接写入目标 mod 目录。
 
 运行：python server.py  → 浏览器打开 http://127.0.0.1:8765
 """
-import http.server, json, os, re, shutil, socketserver, threading, time, statistics, glob
+import http.server, json, os, re, shutil, socketserver, threading, time, statistics, glob, tempfile
 from x4_lookup import X4Lookup
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -345,8 +345,10 @@ def load_config():
 def save_config(cfg):
     try:
         open(CONFIG_FILE, "w", encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))
-    except Exception:
-        pass
+        return True
+    except OSError as e:
+        print("[warn] 配置保存失败：%s" % e)
+        return False
 
 def pick_dir_dialog():
     """弹出 Windows 原生「选择文件夹」对话框（独立 PowerShell 进程，不依赖 python 的 tcl/tk）。
@@ -417,6 +419,96 @@ def copy_to_moding(mod, rel_paths):
             shutil.copy2(src, dst)
             out.append(rp)
     return out
+
+def _rollback_created(mod, created):
+    """写入事务失败回滚：按 created 逆序删除本次新建的文件/目录（忽略已不存在或删除失败）。"""
+    for rp in reversed(created or []):
+        p = rp if os.path.isabs(rp) else os.path.join(mod, rp)
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+            elif os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+# ── 写入事务：覆盖既有文件前快照原内容，失败时统一恢复（配合 _rollback_created） ──
+_TX = threading.local()
+_TX_UNREAD = object()      # 原文件读不到：无法恢复，回滚时保持不动
+
+def _tx_begin():
+    _TX.snap, _TX.new = {}, []
+
+def _tx_record(path):
+    """事务内首次写某文件前记录原内容（None=原本不存在，回滚时删除）。"""
+    snap = getattr(_TX, "snap", None)
+    if snap is None:
+        return
+    p = os.path.abspath(path)
+    if p in snap:
+        return
+    try:
+        snap[p] = open(p, "rb").read() if os.path.isfile(p) else None
+    except OSError:
+        snap[p] = _TX_UNREAD
+
+def _tx_note_new(path):
+    """登记本次事务新建的路径（目录/文件），供异常回滚删除。"""
+    new = getattr(_TX, "new", None)
+    if new is None:
+        return
+    p = os.path.abspath(path)
+    if p not in new:
+        new.append(p)
+
+def _tx_restore():
+    new = getattr(_TX, "new", None) or []
+    for p in reversed(new):
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+            elif os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+    snap = getattr(_TX, "snap", None) or {}
+    for p, data in reversed(list(snap.items())):
+        if data is _TX_UNREAD:
+            continue
+        try:
+            if data is None:
+                if os.path.exists(p):
+                    os.remove(p)
+            else:
+                with open(p, "wb") as f:
+                    f.write(data)
+        except OSError:
+            pass
+
+def _tx_end():
+    _TX.snap = None
+    _TX.new = None
+
+def _txn(fn):
+    """事务装饰器：write_text 覆盖前自动快照；ok=False 或异常时恢复 modified、删除 created。
+    嵌套调用并入外层事务（不重复开事务）。"""
+    def _wrap(d):
+        if getattr(_TX, "snap", None) is not None:
+            return fn(d)
+        _tx_begin()
+        try:
+            r = fn(d)
+            if isinstance(r, dict) and not r.get("ok"):
+                _tx_restore()
+            return r
+        except Exception as e:
+            _tx_restore()
+            return {"ok": False, "error": "写入失败，已回滚：%s" % e}
+        finally:
+            _tx_end()
+    _wrap.__name__ = fn.__name__
+    _wrap.__doc__ = fn.__doc__
+    return _wrap
 
 # ── 模型同步：EGO Blender 导出目录 → 目标 mod ──
 def _sm_units_dir(export_root):
@@ -606,7 +698,7 @@ def ship_model_sync(d):
     py_path = (d.get("py_path") or "").strip()
     mod = (d.get("mod") or "").strip()
     overlay = (d.get("overlay") or "").strip()
-    out = {"ok": False, "ship_id": ship_id, "steps": steps, "log": "", "files": []}
+    out = {"ok": False, "ship_id": ship_id, "steps": steps, "log": "", "files": [], "warnings": []}
     if not ship_id:
         st("参数检查", False, "缺少舰船 id"); return out
     if not re.fullmatch(r'[A-Za-z0-9_.\-]+', ship_id):
@@ -659,7 +751,10 @@ def ship_model_sync(d):
     rel_ani = os.path.join(rel_size, os.path.basename(src_ani)) if src_ani else ""
     rel_dae = os.path.join(rel_size, os.path.basename(src_dae)) if src_dae else ""
 
+    mlp = os.path.join(mod, "libraries", "material_library.xml")
     bk_paths = [os.path.join(mod, rel_ship), tgt_macro, tgt_data]
+    if os.path.isfile(mlp):
+        bk_paths.append(mlp)          # 同步末尾会对齐材质库，一并纳入备份
     if rel_ani:
         bk_paths.append(os.path.join(mod, rel_ani))
     if rel_dae:
@@ -718,10 +813,25 @@ def ship_model_sync(d):
         st("分离 macro 连接点", False, "宏 xml 校验失败: " + err); return out
     st("分离 macro 连接点", True, "%d 条连接点归入舰船宏（同名 ref 沿用旧 connection 值）" % len(blocks))
 
+    # 覆盖前先记录旧舰船 xml（材质对齐时若新船材质全都缺失，用它的第一个材质名做克隆数据源）
+    try:
+        old_comp_txt = _sm_read(target_ship_path) if os.path.isfile(target_ship_path) else ""
+    except OSError:
+        old_comp_txt = ""
     _sm_write(target_ship_path, comp_txt)
     st("写入舰船 xml", True, rel_ship)
     _sm_write(tgt_macro, new_mtxt)
     st("写入舰船宏", True, rel_macro)
+    # 材质库对齐：只补 material_library.xml（新增缺失材质），不改任何其他舰船 xml
+    _al = align_materials_after_sync(mod, target_ship_path, old_comp_txt)
+    out["warnings"] += _al.get("warnings") or []
+    if _al.get("added"):
+        _d = "新增 %d 个材质定义：%s" % (len(_al["added"]), ", ".join(_al["added"]))
+    else:
+        _d = "引用的材质已全部存在，直接复用"
+    if _al.get("warnings"):
+        _d += "；⚠ " + "；".join(_al["warnings"][:3])
+    st("材质库对齐", True, _d)
 
     if os.path.normcase(os.path.abspath(src_data)) == os.path.normcase(os.path.abspath(tgt_data)):
         st("替换模型目录", True, "源与目标为同一目录，跳过")
@@ -825,10 +935,9 @@ def component_assemble(d):
     # xml 补丁：geometry 直接改写为显式 mod 路径（数据必然复制进 mod，见下方复制步骤）。
     # 不用 assets\ 裸路径——实测该写法只在数据属于原版时可解析，mod 自有数据会被拒载 meshsource。
     # 与可用舰船（ship_par_xl_avatar_s 等）的 geometry 约定一致。
-    mod_folder = os.path.basename(os.path.normpath(mod))
-    geo_explicit = "extensions\\%s\\assets\\%s\\%s_data" % (mod_folder, rel_dir.replace("/", "\\"), comp_id)
+    geo_explicit = geo_owned(mod, rel_dir, comp_id)
     text = open(src_xml, encoding="utf-8").read()
-    text = re.sub(r'geometry="[^"]*"', 'geometry="%s"' % geo_explicit, text)
+    text = re.sub(r'geometry="[^"]*"', lambda m: 'geometry="%s"' % geo_explicit, text)
     n_container = len(re.findall(r'<connection name="container" tags=""\s*/>', text))
     text = re.sub(r'<connection name="container" tags=""\s*/>',
                   '<connection name="container" tags="contents" value="0"/>', text)
@@ -897,24 +1006,16 @@ def component_assemble(d):
         out["warnings"].append("组件 id 无 _x数字 后缀，按原样处理，未自动生成宏")
         st("宏生成", True, "跳过（id 无缩放后缀）")
 
-    # index 注册：components.xml + macros.xml
-    mod_folder = os.path.basename(os.path.normpath(mod))
-    for idx_name, nm, rel_tail in [
-        ("components.xml", comp_id, rel_dir.replace("/", "\\") + "\\" + comp_id),
-        ("macros.xml", comp_id + "_macro", rel_dir.replace("/", "\\") + "\\macros\\" + comp_id + "_macro"),
-    ]:
-        if idx_name == "macros.xml" and not macro_done and not os.path.isfile(dst_macro):
-            continue
-        idx_path = os.path.join(mod, "index", idx_name)
+    # index 注册：components.xml + macros.xml（统一走 register_assets）
+    idx_items = [("components", comp_id, rel_dir.replace("/", "\\") + "\\" + comp_id)]
+    if macro_done or os.path.isfile(dst_macro):
+        idx_items.append(("macros", comp_id + "_macro",
+                          rel_dir.replace("/", "\\") + "\\macros\\" + comp_id + "_macro"))
+    for idx_kind, _nm, _rel in idx_items:
+        idx_path = os.path.join(mod, "index", idx_kind + ".xml")
         if not os.path.isfile(idx_path):
-            out["warnings"].append("缺少 " + idx_path); continue
-        tree = ET.parse(idx_path)
-        ent = tree.getroot()
-        if nm not in {e.get("name") for e in ent}:
-            e = ET.SubElement(ent, "entry")
-            e.set("name", nm)
-            e.set("value", "extensions\\%s\\assets\\%s" % (mod_folder, rel_tail))
-            tree.write(idx_path, encoding="UTF-8", xml_declaration=True, short_empty_elements=True)
+            out["warnings"].append("缺少 " + idx_path)
+    register_assets(mod, idx_items)
     st("index 注册", True, "components.xml + macros.xml")
 
     # 图标：复用源组件的升级贴图（否则装配界面/百科显示错图标或不显示模型）。
@@ -1274,9 +1375,9 @@ def dock_clone(d):
     _sm_write(tgt_macro, new_mtxt)
     st("写入组件与宏", True, "%s；%s" % (rel_comp, rel_macro))
 
-    modi = _register_index(mod, [
-        ("components", new_id, "assets\\%s\\%s" % (rel_dir.replace("/", "\\"), new_id)),
-        ("macros", new_id + "_macro", "assets\\%s\\macros\\%s_macro" % (rel_dir.replace("/", "\\"), new_id)),
+    modi = register_assets(mod, [
+        ("components", new_id, "%s\\%s" % (rel_dir.replace("/", "\\"), new_id)),
+        ("macros", new_id + "_macro", "%s\\macros\\%s_macro" % (rel_dir.replace("/", "\\"), new_id)),
     ])
     if modi:
         st("注册 index", True, "；".join(modi))
@@ -1356,10 +1457,13 @@ def vanilla_enums():
     en["purpose"]   = sorted(["fight", "trade", "mine", "build", "auxiliary"])
     en["thruster"]  = sorted(["large", "extralarge"])
     en["secrecy"]   = sorted(["1", "2", "3"])
+    # 舰船尺寸：工具只处理 L/XL（清单扫描、jobs/shipgroups、建造成本均按这两档设计）
+    en["size"]      = sorted(["l", "xl"])
     # 显示名：中文优先（游戏标准译名 / 派系官方中文名），无则用 id
     cn_type = {"fight":"战斗", "trade":"贸易", "mine":"采矿", "build":"建造", "auxiliary":"辅助"}
     cn_thruster = {"large":"大型", "extralarge":"超大型"}
     cn_secrecy = {"1":"机密 1", "2":"机密 2", "3":"机密 3"}
+    cn_size = {"l":"大型 L", "xl":"超大型 XL"}
     fac_by_id = {f["id"]: f["name"] for f in _FACTIONS_ALL}
     def lst(vals, cn):
         return [{"id": v, "name": cn.get(v, "") or v} for v in sorted(vals)]
@@ -1370,6 +1474,7 @@ def vanilla_enums():
         "purpose": lst(en["purpose"], cn_type),
         "thruster": lst(en["thruster"], cn_thruster),
         "secrecy": lst(en["secrecy"], cn_secrecy),
+        "size": lst(en["size"], cn_size),
     }
 
 def _ext_order():
@@ -1434,8 +1539,8 @@ def _cache_save(name, data):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, fp)
-    except Exception:
-        pass
+    except OSError as e:
+        print("[warn] 磁盘缓存写入失败（%s）：%s" % (name, e))
 
 def _cached_sources(name, sources, scan, exts=(".xml",), only_dirs=None):
     """按来源分片缓存。sources=[(src,[paths...])]，scan(src)->可 JSON 化结果。
@@ -1944,6 +2049,7 @@ def apply_props(mtxt, d):
     return mtxt
 
 # ---------- 生成核心 ----------
+@_txn
 def generate(d):
     """data: 用户表单。执行复制模型+改名+生成XML+更新注册。返回结果。"""
     new_id = (d.get("new_id") or "").strip().lower()
@@ -1957,7 +2063,11 @@ def generate(d):
         return {"ok": False, "error": "请选择模板舰船"}
     if any(t["id"] == new_id for t in tlist):
         return {"ok": False, "error": "舰船ID已存在：%s（同 id 会覆盖已有宏与贴图别名，请换一个）" % new_id}
-    size = tpl["size"]                       # 新船尺寸=模板尺寸（component class 承载，与 id 无关）
+    # 新船尺寸：默认跟随模板，可在 ⑤ 外观与分类里改（L↔XL）。
+    # 尺寸决定文件归属目录 size_l/size_xl、component/macro 的 class 及注册表分组。
+    size = (d.get("size") or "").strip().lower() or tpl["size"]
+    if size not in ("s", "m", "l", "xl"):
+        return {"ok": False, "error": "舰船尺寸无效：%s（支持 s / m / l / xl）" % size}
     name = re.sub(r"^ship_", "", new_id)     # 去掉可选的 ship_ 前缀，用于默认名称与 storage 派生
     faction = d.get("faction") or RACE_FACTION.get(tpl.get("race_code") or "", "argon")
     mod = d.get("target_mod") or MOD_DIR
@@ -1971,8 +2081,9 @@ def generate(d):
     # 模板源目录：按模板来源（vanilla 或 mod 目录名）定位，模拟游戏从对应扩展读取
     src_base = os.path.join(ROOT, "assets") if tpl["source"] == "vanilla" else os.path.join(ROOT, "extensions", tpl["source"], "assets")
 
-    size_dir = "size_" + size
-    un = "units", size_dir            # src_base 已含 assets，这里不带 assets 前缀，避免 assets\assets 重复
+    # 模板源目录按模板自身尺寸定位；写入目录按新船尺寸定位（L 模板可生成 XL 船）
+    src_un = "units", "size_" + tpl["size"]
+    un = "units", "size_" + size      # src_base 已含 assets，这里不带 assets 前缀，避免 assets\assets 重复
     comp_name = new_id                    # ship_spl_xl_golem
     mac_name  = new_id + "_macro"
     stor_id   = "storage_" + name + "_macro"   # 对齐原版 storage_<去ship_前缀> 惯例，但不依赖强前缀（引擎只按 ref 精确引用）
@@ -1981,7 +2092,7 @@ def generate(d):
     created, modified = [], []
     # ---------- 1. 复制模型文件并改名 ----------
     # 1a. component ship_xxx.xml
-    src_comp = os.path.join(src_base, *un, tpl["id"] + ".xml")
+    src_comp = os.path.join(src_base, *src_un, tpl["id"] + ".xml")
     if not os.path.isfile(src_comp):
         return {"ok": False, "error": "模板 component 缺失: %s" % src_comp}
     # diff 补丁型模板（如 vro 覆盖原版船）：必须合并 base 后再复制，
@@ -1989,12 +2100,15 @@ def generate(d):
     ctxt = _read_ship_comp_txt(src_comp, tpl["size"], tpl["id"], tpl["source"])
     # 改名 component name（必须，否则组件重名冲突）
     ctxt = ctxt.replace('name="%s"' % tpl["id"], 'name="%s"' % comp_name)
+    if size != tpl["size"]:
+        # 尺寸改变时 class 必须同步，否则游戏仍按模板尺寸处理（L 模板 → XL 船）
+        ctxt = ctxt.replace('class="ship_%s"' % tpl["size"], 'class="ship_%s"' % size)
     mod_name = os.path.basename(mod)
     _geo_warns = []
     # 1b. data 目录先于组件写入复制：复制结果决定 geometry 改写。
     # 数据就绪 → geometry 指向新数据目录；缺失/复制失败 → 保持指向模板数据（共享），
     # 避免 geometry 悬空导致碰撞网格无效（玩家上船僵死的同类隐患）。
-    src_data = os.path.join(src_base, *un, tpl["id"] + "_data")
+    src_data = os.path.join(src_base, *src_un, tpl["id"] + "_data")
     data_ready = False
     if os.path.isdir(src_data):
         dst_data = rel("assets", *un, comp_name + "_data")
@@ -2004,20 +2118,18 @@ def generate(d):
             created.append(os.path.relpath(dst_data, mod))
             data_ready = True
         except (OSError, shutil.Error) as e:
+            if os.path.isdir(dst_data):
+                shutil.rmtree(dst_data, ignore_errors=True)   # 复制半成品目录清理，避免留下不完整模型数据
             _geo_warns.append("模型数据目录复制失败（%s）：新船共享模板模型数据" % e)
     else:
         _geo_warns.append("模板模型数据目录 %s_data 不存在：新船共享模板模型数据（geometry 未改写）" % tpl["id"])
     if data_ready:
-        # source 路径: 模板 id 目录 -> 新 id 目录
-        ctxt = ctxt.replace("\\"+tpl["id"]+"_data", "\\"+comp_name+"_data")
-        ctxt = ctxt.replace("/"+tpl["id"]+"_data", "/"+comp_name+"_data")
-        # 几何路径归属：模板来自原版/DLC/其他 mod 时，<source geometry> 的 mod 段改为目标 mod（数据目录随目标走）
-        if tpl["source"] == "vanilla":
-            ctxt = re.sub(r'(geometry=")assets([/\\])',
-                          lambda m: m.group(1) + "extensions" + m.group(2) + mod_name + m.group(2) + "assets" + m.group(2), ctxt)
-        elif tpl["source"] != mod_name:
-            ctxt = re.sub(r'(geometry="extensions[/\\])%s([/\\])' % re.escape(tpl["source"]),
-                          r'\g<1>%s\g<2>' % mod_name, ctxt)
+        # 几何路径统一改归属到目标 mod 的显式路径，并把模板 id 的数据目录名改为新 id。
+        # （原版裸 assets\ / 其他 mod 的 extensions\ 前缀都归到 extensions\<目标mod>\assets\）
+        ctxt = re.sub(r'(geometry=")([^"]*)(")',
+                      lambda m: m.group(1) + geo_rebase(m.group(2), mod_name, tpl["id"], comp_name,
+                                                        tpl["size"], size) + m.group(3),
+                      ctxt)
     # 挂载点 tags：按连接点写回新船 component（可选，按组/逐槽指定 tags）
     mtags = d.get("mount_tags") or []
     if mtags:
@@ -2026,13 +2138,14 @@ def generate(d):
     dst_comp = rel("assets", *un, comp_name + ".xml")   # 写入带 assets 层（与 index 注册值及既有船布局一致）
     _err = _xml_check(ctxt)
     if _err:
+        _rollback_created(mod, created)
         return {"ok": False, "error": "component XML 非法，拒绝写入（%s）：%s" % (os.path.basename(dst_comp), _err)}
     os.makedirs(os.path.dirname(dst_comp), exist_ok=True)
-    open(dst_comp, "w", encoding="utf-8").write(ctxt)
+    write_text(dst_comp, ctxt)
     created.append(os.path.relpath(dst_comp, mod))
 
     # 1c. .ani 文件
-    src_ani = os.path.join(src_base, *un, tpl["id"] + "_data.ani")
+    src_ani = os.path.join(src_base, *src_un, tpl["id"] + "_data.ani")
     if os.path.isfile(src_ani):
         dst_ani = rel("assets", *un, comp_name + "_data.ani")
         shutil.copy2(src_ani, dst_ani)
@@ -2064,8 +2177,9 @@ def generate(d):
         if da_comp:
             dat = open(da_comp, encoding="utf-8").read()
             dat = dat.replace('name="%s"' % da_name, 'name="%s"' % new_da)
-            # geometry 共享原版数据：不改 _data 目录名、不改归属前缀、不复制数据目录。
-            # 否则 geometry 会指向不存在的新名目录（如 DLC 模板时）→ 碰撞网格无效 → 玩家上船僵死。
+            # 几何共享：dockarea 不复制数据目录，因此 geometry 原样保留（不改 _data 目录名、
+            # 不改归属前缀）。若改成新名目录会指向不存在路径（如 DLC 模板）→ 碰撞网格无效 → 玩家上船僵死。
+            # 这是显式的「共享不改」分支，与舰船/装备的 geo_owned 自有分支区分。
             nd = rel("assets","structures","dock", new_da+".xml")
             os.makedirs(os.path.dirname(nd), exist_ok=True)
             open(nd,"w",encoding="utf-8").write(dat)
@@ -2091,10 +2205,14 @@ def generate(d):
 
     # ---------- 2. 生成 ship macro ----------
     # 宏文件名可能带变体后缀（如 ship_atf_xl_battleship_01_a_macro.xml），用 _find_ship_macro 定位
-    src_mac = _find_ship_macro(os.path.join(src_base, *un), tpl["id"])
+    src_mac = _find_ship_macro(os.path.join(src_base, *src_un), tpl["id"])
     if not os.path.isfile(src_mac):
+        _rollback_created(mod, created)
         return {"ok":False,"error":"模板 macro 缺失: %s"%src_mac}
     mtxt = open(src_mac, encoding="utf-8").read()
+    if size != tpl["size"]:
+        # 尺寸改变时 macro class 同步（class="ship_l" → class="ship_xl"）
+        mtxt = mtxt.replace('class="ship_%s"' % tpl["size"], 'class="ship_%s"' % size)
     # 宏名 = 模板宏文件名去 .xml（兼容 _a 等变体后缀）；按 cid+"_macro" 硬拼会替换落空导致宏重名
     tpl_mac_name = os.path.basename(src_mac)[:-4]
     mtxt = mtxt.replace('name="%s"'%tpl_mac_name, 'name="%s"'%mac_name)
@@ -2133,6 +2251,7 @@ def generate(d):
         comp_names = [c["name"] for c in ship_component_connections(tpl["id"], tpl["source"])]
         mtxt2, mc_err = _apply_macro_connections(mtxt, mc.get("rows") or [], comp_names, subst)
         if mc_err:
+            _rollback_created(mod, created)
             return {"ok": False, "error": "macro connections：" + mc_err}
         mtxt = mtxt2
     dst_mac = rel("assets", *un, "macros", mac_name + ".xml")
@@ -2141,8 +2260,9 @@ def generate(d):
         mtxt = _apply_ship_software(mtxt, d["software"])
     _err = _xml_check(mtxt)
     if _err:
+        _rollback_created(mod, created)
         return {"ok": False, "error": "macro XML 非法（多为模板文件原有坏标签，请检查 %s），拒绝写入：%s" % (tpl["id"]+"_macro.xml", _err)}
-    open(dst_mac,"w",encoding="utf-8").write(mtxt)
+    write_text(dst_mac, mtxt)
     created.append(os.path.relpath(dst_mac, mod))
 
     # ---------- 3. 生成 storage macro ----------
@@ -2151,7 +2271,7 @@ def generate(d):
     # 都没有才走标准兜底
     src_st = ""
     if tpl_stor_name:
-        for _cand in (os.path.join(src_base, *un, "macros", tpl_stor_name + ".xml"),
+        for _cand in (os.path.join(src_base, *src_un, "macros", tpl_stor_name + ".xml"),
                       os.path.join(src_base, "props", "storagemodules", "macros", tpl_stor_name + ".xml")):
             if os.path.isfile(_cand):
                 src_st = _cand
@@ -2163,9 +2283,10 @@ def generate(d):
         dst_st = rel("assets", *un, "macros", stor_id + ".xml")
         _err = _xml_check(stxt)
         if _err:
+            _rollback_created(mod, created)
             return {"ok": False, "error": "storage macro XML 非法，拒绝写入（%s）：%s" % (os.path.basename(dst_st), _err)}
         os.makedirs(os.path.dirname(dst_st), exist_ok=True)
-        open(dst_st,"w",encoding="utf-8").write(stxt)
+        write_text(dst_st, stxt)
         created.append(os.path.relpath(dst_st, mod))
     else:
         # 模板没有独立 storage 文件：直接生成标准 storage macro
@@ -2177,13 +2298,18 @@ def generate(d):
                                                                   d.get("cargo") or "35000")
         dst_st = rel("assets", *un, "macros", stor_id + ".xml")
         os.makedirs(os.path.dirname(dst_st), exist_ok=True)
-        open(dst_st,"w",encoding="utf-8").write(stxt)
+        write_text(dst_st, stxt)
         created.append(os.path.relpath(dst_st, mod))
 
     # ---------- 4. 更新注册文件 ----------
     upd = update_registry(mod, comp_name, mac_name, stor_id, new_da if (tpl["dockarea"] and da_ok) else None,
                           faction, size, name, d, tids)
     modified += upd.get("files", [])
+    # ⑥-1 shipgroup 归属：按界面勾选写入（未启用则不写，也不再兜底默认组）
+    sgc = d.get("shipgroups") or {}
+    if sgc.get("enabled") and (sgc.get("groups") or []):
+        modified += shipgroup_save_all(mod, new_id, sgc, faction=faction, size=size,
+                                       extra_factions=(d.get("jobs") or {}).get("factions"))
     # 材质：合并模板 mod 的材质 collection 到目标 mod material_library，避免新船依赖模板 mod
     modified += merge_material_library(mod, src_comp, tpl["source"])
     # 材质参数调整（须在 collection 合并之后：本 mod 材质就地改值，外部材质追加 diff replace；
@@ -2250,28 +2376,31 @@ def merge_material_library(mod, tpl_comp_path, tpl_source):
     if not blocks:
         return []
     mlp = os.path.join(mod, "libraries", "material_library.xml")
-    to_add = blocks
     if os.path.isfile(mlp):
         txt = open(mlp, encoding="utf-8").read()
         existing = set(re.findall(r'<collection\s+name="([^"]+)"', txt))
-        to_add = [(c, b) for c, b in blocks if c not in existing]
-        if to_add:
-            addtxt = "\n\t\t" + "\n\t\t".join(b for _, b in to_add)
-            i = txt.rfind("</add>")
-            if i >= 0:
-                txt = txt[:i] + addtxt + txt[i:]
-            else:
-                txt = (DIFF_HEADER + '\t<add sel="//materiallibrary">\n'
-                       + "\n\t\t".join(b for _, b in to_add) + '\n\t</add>\n</diff>')
-            open(mlp, "w", encoding="utf-8").write(txt)
-    else:
-        os.makedirs(os.path.dirname(mlp), exist_ok=True)
-        open(mlp, "w", encoding="utf-8").write(
-            DIFF_HEADER + '\t<add sel="//materiallibrary">\n'
-            + "\n\t\t".join(b for _, b in to_add) + '\n\t</add>\n</diff>')
-    if to_add:
+        added = 0
+        for c, b in blocks:
+            if c in existing:
+                continue
+            ntxt = _ml_insert_collection(txt, b)
+            if ntxt is None:
+                return []
+            txt = ntxt
+            added += 1
+        if not added:
+            return []
+        write_text(mlp, txt)
         return [os.path.relpath(mlp, mod)]
-    return []
+    txt = DIFF_HEADER + '\t<add sel="//materiallibrary">\n\t</add>\n</diff>\n'
+    for c, b in blocks:
+        ntxt = _ml_insert_collection(txt, b)
+        if ntxt is None:
+            return []
+        txt = ntxt
+    os.makedirs(os.path.dirname(mlp), exist_ok=True)
+    write_text(mlp, txt)
+    return [os.path.relpath(mlp, mod)]
 
 # ---------------- 船体材质参数（material_library.xml 读取/调整） ----------------
 # 船体 PBR 着色器（p1/p2_complex_surface）常用 Float 参数白名单：(属性名, 中文名, 修改效果说明, 取值范围)
@@ -2411,16 +2540,55 @@ def _ml_set_block_prop(block, ptype, p, v):
                 newtag = tag[:-2].rstrip() + ' value="%s" />' % v
             return block[:tm.start()] + newtag + block[tm.end():], True
     if "</properties>" in block:
-        return block.replace("</properties>",
-                             '\t\t\t\t<property type="%s" name="%s" value="%s" />\n\t\t\t</properties>'
-                             % (ptype, p, v), 1), True
+        cm = re.search(r'([ \t]*)</properties>', block)
+        ind = cm.group(1) if cm else "\t\t\t"
+        return block.replace(ind + "</properties>",
+                             '%s\t<property type="%s" name="%s" value="%s" />\n%s</properties>'
+                             % (ind, ptype, p, v, ind), 1), True
     return block, False
 
 def _ml_reindent(block, base):
-    """把材质块文本去掉原有公共缩进、改按 base 缩进，便于插入目标文件。"""
+    """把材质块按标签层级重排缩进后插入目标文件（原块从 <material> 处截取，
+    首行没有缩进，首尾行也不一定同缩进，不能按最小缩进整体平移）。"""
     lines = block.strip("\n").split("\n")
-    ind = min((len(l) - len(l.lstrip())) for l in lines if l.strip())
-    return "\n".join((base + l[ind:]) if l.strip() else "" for l in lines)
+    if not lines:
+        return block
+    depth = 0
+    out = []
+    for l in lines:
+        s = l.strip()
+        if not s:
+            out.append("")
+            continue
+        if s.startswith("</"):
+            depth = max(0, depth - 1)
+        out.append(base + "\t" * depth + s)
+        if (s.startswith("<") and not s.startswith("</") and not s.startswith("<!")
+                and not s.endswith("/>") and not re.search(r'</\w+>\s*$', s)):
+            depth += 1
+    return "\n".join(out)
+
+def _ml_insert_add_child(txt, add):
+    """把已带缩进的顶层片段（collection 块，含结尾换行）插入 //materiallibrary 的 add 块末尾。
+    按行边界插入；没有 add 块则新建。无法插入（非 diff 结构）返回 None。"""
+    am = re.search(r'<add\s+sel="//materiallibrary"[^>]*>.*?</add>', txt, re.S)
+    if am:
+        pos = txt.rfind("</add>", am.start(), am.end())
+        ls = txt.rfind("\n", 0, pos) + 1
+        indent = txt[ls:pos]
+        if indent.strip():                         # </add> 与内容同行，先换行
+            return txt[:pos] + "\n" + add + txt[pos:]
+        return txt[:ls] + add + indent + txt[pos:]
+    block = '\t<add sel="//materiallibrary">\n%s\t</add>\n' % add
+    if "</diff>" in txt:
+        return txt.replace("</diff>", block + "</diff>", 1)
+    if not txt.strip():
+        return DIFF_HEADER + block + "</diff>\n"
+    return None
+
+def _ml_insert_collection(txt, block):
+    """把整个 <collection> 块按层级重排后插入材质库（新建 collection，不覆盖同名）。"""
+    return _ml_insert_add_child(txt, _ml_reindent(block, "\t\t") + "\n")
 
 def _ml_insert_material(txt, coll, mat_block):
     """把 <material> 块插入材质库文本中名为 coll 的 collection；没有则新建 collection（在 //materiallibrary 的 add 块内）。
@@ -2429,18 +2597,13 @@ def _ml_insert_material(txt, coll, mat_block):
     cm = re.search(r'<collection\s+name="%s"[^>]*>.*?</collection>' % re.escape(coll), txt, re.S)
     if cm:
         pos = txt.rfind("</collection>", cm.start(), cm.end())
-        return txt[:pos] + body + "\n\t\t" + txt[pos:]
+        ls = txt.rfind("\n", 0, pos) + 1
+        indent = txt[ls:pos]
+        if indent.strip():                         # </collection> 与内容同行，先换行
+            return txt[:pos] + "\n" + body + "\n" + txt[pos:]
+        return txt[:ls] + body + "\n" + indent + txt[pos:]
     add = ('\t\t<collection name="%s">\n%s\n\t\t</collection>\n' % (coll, body))
-    am = re.search(r'<add\s+sel="//materiallibrary"[^>]*>.*?</add>', txt, re.S)
-    if am:
-        pos = txt.rfind("</add>", am.start(), am.end())
-        return txt[:pos] + add + "\t" + txt[pos:]
-    block = '\t<add sel="//materiallibrary">\n%s\t</add>\n' % add
-    if "</diff>" in txt:
-        return txt.replace("</diff>", block + "</diff>", 1)
-    if not txt.strip():
-        return DIFF_HEADER + block + "</diff>\n"
-    return None
+    return _ml_insert_add_child(txt, add)
 
 def _ml_clone_material(txt, ref, newname, warns):
     """把 ref（collection.material）的生效定义克隆为同 collection 下的 newname，写入目标材质库文本。
@@ -2468,9 +2631,146 @@ def _ml_clone_material(txt, ref, newname, warns):
         return txt, None
     return ntxt, new_ref
 
+def _ship_material_refs(comp_txt):
+    """按出现顺序收集 component 里 <materials> 内的材质引用（去重，lod0 在前）。"""
+    refs = []
+    for mm in re.finditer(r'<material\b[^>]*\bref="([^"]+\.[^"]+)"', comp_txt or ""):
+        if mm.group(1) not in refs:
+            refs.append(mm.group(1))
+    return refs
+
+def align_materials_after_sync(mod, comp_path, old_comp_txt=""):
+    """模型同步后，让本 mod 的 material_library.xml 补齐新舰船 component 引用的材质定义。
+    规则（按用户口径）：引用的材质名全部已存在 → 全复用，不改材质库；有缺失才新增。
+    新增时优先复制「新舰船 xml 中第一个已存在的材质」的数据；全都缺失则用
+    「同步前旧舰船 xml 第一个材质」的数据；再兜底用本 mod 材质库第一个材质。
+    只新增，绝不重命名/删除已有材质，也不改任何其他舰船 xml。
+    返回 {"added": [...], "warnings": [...], "ok": bool}。"""
+    res = {"added": [], "warnings": [], "ok": True}
+    try:
+        new_txt = open(comp_path, encoding="utf-8", errors="ignore").read()
+    except OSError as e:
+        res["ok"] = False
+        res["warnings"].append("读取新舰船 xml 失败: %s" % e)
+        return res
+    refs = _ship_material_refs(new_txt)
+    if not refs:
+        return res
+    mlp = os.path.join(mod, "libraries", "material_library.xml")
+    lib_txt = open(mlp, encoding="utf-8", errors="ignore").read() if os.path.isfile(mlp) else ""
+
+    def _exists(ref):
+        coll, mat = ref.split(".", 1)
+        return bool(_ml_find_material_span(lib_txt, coll, mat) or _ml_resolve(ref)[0])
+
+    missing = [r for r in refs if not _exists(r)]
+    if not missing:
+        return res
+    # 克隆数据源：新船 xml 第一个已存在材质 → 旧船 xml 第一个材质 → 本库第一个材质
+    donor_raw = ""
+    for r in refs:
+        if r not in missing:
+            donor_raw = _ml_resolve(r)[2] or ""
+            if donor_raw:
+                break
+    if not donor_raw and old_comp_txt:
+        for r in _ship_material_refs(old_comp_txt):
+            donor_raw = _ml_resolve(r)[2] or ""
+            if donor_raw:
+                break
+    if not donor_raw and lib_txt:
+        dm = re.search(r'<material\b[^>]*name="[^"]+"[^>]*>.*?</material>', lib_txt, re.S)
+        donor_raw = dm.group(0) if dm else ""
+    if not donor_raw:
+        res["ok"] = False
+        res["warnings"].append("材质库没有可用作克隆的材质数据，无法补齐: %s" % ", ".join(missing))
+        return res
+    changed = False
+    for ref in missing:
+        if "." not in ref:
+            continue
+        coll, mat = ref.split(".", 1)
+        if _ml_find_material_span(lib_txt, coll, mat):
+            continue                                   # 本轮已插入
+        clone = re.sub(r'(<material\s+name=")[^"]*(")', r'\g<1>%s\g<2>' % mat, donor_raw, count=1)
+        ntxt = _ml_insert_material(lib_txt, coll, clone)
+        if ntxt is None:
+            res["warnings"].append("无法写入 %s（材质库非 diff 结构）" % ref)
+            continue
+        lib_txt, changed = ntxt, True
+        res["added"].append(ref)
+    if changed:
+        os.makedirs(os.path.dirname(mlp), exist_ok=True)
+        write_text(mlp, lib_txt)
+    return res
+
+def _ml_swap_tex_paths(block, old_coll, new_coll):
+    """把材质块里纹理路径的 \\旧collection\\ 段换成 \\新collection\\（大小写不敏感，兼容 /）。
+    例如 assets\\textures\\megathron\\r_a.dds → assets\\textures\\revelation\\r_a.dds。"""
+    if not old_coll or not new_coll or old_coll == new_coll:
+        return block
+    pat = re.compile(r'(?i)([/\\])%s([/\\])' % re.escape(old_coll))
+    return pat.sub(lambda m: m.group(1) + new_coll + m.group(2), block)
+
+def _ml_fix_clone_tex_folder(txt, block, coll, mat):
+    """修复旧版本克隆：把块内 extensions\\...\\assets\\textures\\<旧目录>\\ 的目录段改为 <coll>。
+    仅当库中确实存在同名材质 <旧目录>.<mat>（证明是从它克隆而来）时才替换，
+    避免误改 generic 等共享纹理目录。"""
+    out = block
+    for f in set(re.findall(r'(?i)assets[/\\]textures[/\\]([^/\\]+)[/\\]', block)):
+        if f.lower() == coll.lower():
+            continue
+        if _ml_find_material_span(txt, f, mat) or _ml_resolve("%s.%s" % (f, mat))[0]:
+            out = re.sub(r'(?i)([/\\])%s([/\\])' % re.escape(f),
+                         lambda m: m.group(1) + coll + m.group(2), out)
+    return out
+
+def _ml_rename_ref_addonly(txt, ref, new_ref, warns):
+    """把本船引用 ref 换成 new_ref（前缀.通用名）。材质库只增不改：
+    new_ref 已存在（本库/原版/其他 mod 均可）→ 直接复用，不动材质库；
+    不存在 → 克隆 ref 的现有材质定义到 new_ref 所属 collection（没有该 collection 则新建）。
+    克隆/复用时把材质内纹理路径中的旧 collection 目录段换成新前缀目录。
+    绝不重命名/删除已有材质。返回新材质库文本；无法克隆返回 None（调用方保留原引用）。"""
+    if "." not in ref or "." not in new_ref:
+        return txt
+    ocoll = ref.split(".", 1)[0]
+    ncoll, nmat = new_ref.split(".", 1)
+    if ref == new_ref:
+        # 本船已是新前缀：修复旧版本克隆留下的旧纹理目录段
+        span = _ml_find_material_span(txt, ncoll, nmat)
+        if not span:
+            return txt
+        blk = txt[span[0]:span[1]]
+        nb = _ml_fix_clone_tex_folder(txt, blk, ncoll, nmat)
+        return txt if nb == blk else (txt[:span[0]] + nb + txt[span[1]:])
+    span = _ml_find_material_span(txt, ncoll, nmat)
+    if span:
+        # 目标材质已在本地库（可能是旧版本克隆留下的）：只修纹理目录段，不重命名、不删改其他内容
+        blk = txt[span[0]:span[1]]
+        nb = _ml_swap_tex_paths(blk, ocoll, ncoll)
+        return txt if nb == blk else (txt[:span[0]] + nb + txt[span[1]:])
+    if _ml_resolve(new_ref)[0]:
+        return txt                                   # 全复用：材质库无需修改
+    _, _, raw = _ml_resolve(ref)
+    if not raw:
+        span = _ml_find_material_span(txt, *ref.split(".", 1))
+        raw = span[2] if span else ""
+    if not raw:
+        warns.append("材质 %s 未找到定义，无法新增 %s，引用保持不变" % (ref, new_ref))
+        return None
+    clone = re.sub(r'(<material\s+name=")[^"]*(")', r'\g<1>%s\g<2>' % nmat, raw, count=1)
+    clone = _ml_swap_tex_paths(clone, ocoll, ncoll)
+    ntxt = _ml_insert_material(txt, ncoll, clone)
+    if ntxt is None:
+        warns.append("目标材质库非 diff 结构，无法新增材质 %s" % new_ref)
+        return None
+    return ntxt
+
 def apply_material_tuning(mod, tuning, comp_path=None, comp_backup=None, rename_mode="clone"):
     """把勾选的材质调整写入目标 mod。
     values 形态：{ref: {"rename": 新材质名(可选), "params": {prop: value}}}
+    tuning.prefix（可选）：统一新前缀，本船每个材质改为「prefix.通用名」；材质库已有同名定义
+    直接复用，缺失才新增副本；只改写本船 component，绝不改其他舰船引用。
     - rename（rename_mode="clone"，新增模式）：克隆该材质为新名副本（写入目标 mod 材质库），
       并把本船 component 中所有 ref 指向新名；原材质与其他共用它的船不受影响。
     - rename（rename_mode="replace"，修改模式）：就地重命名目标 mod 材质库里的材质定义，
@@ -2484,16 +2784,23 @@ def apply_material_tuning(mod, tuning, comp_path=None, comp_backup=None, rename_
     if not isinstance(tuning, dict) or not tuning.get("enabled"):
         return rels, warns
     values = tuning.get("values") or {}
-    if not values:
+    prefix = (tuning.get("prefix") or "").strip()
+    if not values and not prefix:
         return rels, warns
     allowed = {n for n, _, _, _ in MAT_TUNABLE}
     name_re = re.compile(r"^[A-Za-z0-9_]+$")
+    if prefix and not name_re.match(prefix):
+        warns.append("新材质前缀 %s 含非法字符（仅允许字母/数字/下划线），前缀功能已跳过" % prefix)
+        prefix = ""
     mlp = os.path.join(mod, "libraries", "material_library.xml")
     txt = open(mlp, encoding="utf-8").read() if os.path.isfile(mlp) else ""
     changed = False
-    # 第一遍：处理改名（克隆/替换），得到最终生效 ref -> params
+    # 第一遍：处理改名，得到最终生效 ref -> params
+    # 全名（含点）= 前缀换名：材质库只增不改，且只改本船引用；
+    # 裸名（无点）= 兼容旧语义：同 collection 内改名（新增=克隆 / 修改=就地重命名）
     final = {}
-    comp_rewrites = []
+    comp_rewrites = []        # 旧语义：按 rename_mode 决定改写范围
+    comp_rewrites_self = []   # 前缀换名：只改写本船 component
     for ref, spec in values.items():
         if "." not in ref or not isinstance(spec, dict):
             continue
@@ -2503,11 +2810,25 @@ def apply_material_tuning(mod, tuning, comp_path=None, comp_backup=None, rename_
             newname, params = "", spec                     # 兼容旧形态 {prop: value}
         if not isinstance(params, dict):
             params = {}
-        if newname:
+        full = newname or (("%s.%s" % (prefix, ref.split(".", 1)[1])) if prefix else "")
+        if full and "." in full:
+            npre, nmat = full.split(".", 1)
+            if not (name_re.match(npre) and name_re.match(nmat)):
+                warns.append("新材质名 %s 格式错误（应为 前缀.名称，两段仅允许字母/数字/下划线），已跳过 %s"
+                             % (full, ref))
+            else:
+                ntxt = _ml_rename_ref_addonly(txt, ref, full, warns)
+                if ntxt is not None:
+                    if ntxt != txt:
+                        txt, changed = ntxt, True
+                    if full != ref:
+                        comp_rewrites_self.append((ref, full))
+                    ref = full
+        elif full:
             coll, mat = ref.split(".", 1)
-            if not name_re.match(newname):
-                warns.append("新材质名 %s 含非法字符（仅允许字母/数字/下划线），已跳过 %s" % (newname, ref))
-            elif newname == mat:
+            if not name_re.match(full):
+                warns.append("新材质名 %s 含非法字符（仅允许字母/数字/下划线），已跳过 %s" % (full, ref))
+            elif full == mat:
                 warns.append("新材质名与原名称相同（%s），已跳过" % ref)
             elif rename_mode == "replace":
                 # 修改模式：就地重命名本 mod 材质库中的定义，引用改写见函数尾部全 mod 扫描
@@ -2594,8 +2915,24 @@ def apply_material_tuning(mod, tuning, comp_path=None, comp_backup=None, rename_
                 changed = True
     if changed:
         os.makedirs(os.path.dirname(mlp), exist_ok=True)
-        open(mlp, "w", encoding="utf-8").write(txt)
+        write_text(mlp, txt)
         rels.append(os.path.relpath(mlp, mod))
+    # 前缀换名：只改写本船 component 的 ref，不扫描其他 XML（不影响共用同一 collection 的其他船）
+    if comp_rewrites_self and comp_path and os.path.isfile(comp_path):
+        ctxt = open(comp_path, encoding="utf-8", errors="ignore").read()
+        n_all = 0
+        for old_ref, new_ref in comp_rewrites_self:
+            if old_ref == new_ref:
+                continue
+            n = ctxt.count('ref="%s"' % old_ref)
+            if n:
+                ctxt = ctxt.replace('ref="%s"' % old_ref, 'ref="%s"' % new_ref)
+                n_all += n
+        if n_all:
+            if comp_backup:
+                comp_backup(comp_path)
+            write_text(comp_path, ctxt)
+            rels.append(os.path.relpath(comp_path, mod))
     # 改写材质引用（材质名关联的 XML 一并修改）
     if comp_rewrites:
         def _rewrite(fp):
@@ -2609,7 +2946,7 @@ def apply_material_tuning(mod, tuning, comp_path=None, comp_backup=None, rename_
             if n_all:
                 if comp_backup:
                     comp_backup(fp)
-                open(fp, "w", encoding="utf-8").write(ctxt)
+                write_text(fp, ctxt)
                 rels.append(os.path.relpath(fp, mod))
             return n_all
         if rename_mode == "replace":
@@ -2687,7 +3024,7 @@ def edit(d):
     _err = _xml_check(mtxt)
     if _err:
         return {"ok": False, "error": "修改后的 macro XML 非法（多为文件原有坏标签），拒绝写入：%s" % _err}
-    open(mac_path, "w", encoding="utf-8").write(mtxt)
+    write_text(mac_path, mtxt)
     modified.append(os.path.relpath(mac_path, mod))
 
     # 2. storage macro：cargo / makerrace（从 ship macro connections 读实际 ref）
@@ -2703,7 +3040,7 @@ def edit(d):
             _err = _xml_check(stxt)
             if _err:
                 return {"ok": False, "error": "修改后的 storage macro XML 非法，拒绝写入：%s" % _err}
-            open(st_path, "w", encoding="utf-8").write(stxt)
+            write_text(st_path, stxt)
             modified.append(os.path.relpath(st_path, mod))
 
     # 3. t 文本：更新已有 name/basename/description 条目（不新增、不改 id）
@@ -2722,7 +3059,7 @@ def edit(d):
                 esc = (text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
                 txt = re.sub(r'(<t id="%d">)[^<]*(</t>)' % tid,
                              lambda m: m.group(1) + esc + m.group(2), txt)
-            open(tp, "w", encoding="utf-8").write(txt)
+            write_text(tp, txt)
             modified.append(os.path.relpath(tp, mod))
 
     # 4. jobs：AI 派系主动使用（可选，修改模式也能补/更新）
@@ -2730,10 +3067,15 @@ def edit(d):
     if jobs_cfg.get("enabled") and tpl.get("tids") and tpl["tids"][0]:
         modified += write_jobs(mod, cid + "_macro", size, jobs_cfg, tpl["tids"][0])
 
-    # 4.5 shipgroup：AI 调度候选分组（并入整船保存，可多分组）
+    # 4.5 shipgroup：AI 调度候选分组（并入整船保存，可多分组；关闭时清理本船条目）
     shipgroups_cfg = d.get("shipgroups") or {}
     if shipgroups_cfg.get("enabled") and (shipgroups_cfg.get("groups") or []):
-        modified += shipgroup_save_all(mod, cid, shipgroups_cfg)
+        rc_sg = cid.split("_")[1] if "_" in cid else ""
+        modified += shipgroup_save_all(mod, cid, shipgroups_cfg,
+                                       faction=RACE_FACTION.get(rc_sg, "argon"), size=size,
+                                       extra_factions=(d.get("jobs") or {}).get("factions"))
+    else:
+        modified += shipgroup_clear(mod, cid)
 
     # 5. 建造成本（wares.xml）：更新已有或追加
     if tpl.get("tids") and tpl["tids"][0]:
@@ -2755,7 +3097,7 @@ def edit(d):
             ct = open(comp_path, encoding="utf-8", errors="ignore").read()
             nct, n = write_mount_tags(ct, mtags)
             if n:
-                open(comp_path, "w", encoding="utf-8").write(nct)
+                write_text(comp_path, nct)
                 modified.append(os.path.relpath(comp_path, mod))
 
     # 8. 材质参数（material_library.xml）：改名=克隆副本并改写本船 component 引用；
@@ -2800,7 +3142,7 @@ def allocate_tids(d):
                         v = int(m.group(1))
                         if v > maxid:
                             maxid = v
-                except Exception:
+                except OSError:
                     pass
     return [maxid+1, maxid+2, maxid+3]
 
@@ -2896,11 +3238,52 @@ def ship_jobs(ship_id, source=None):
                 "tasks": sorted(tasks), "exists": bool(facs)}
     return {"ship": ship_id, "enabled": False, "factions": [], "tasks": [], "exists": False}
 
+def _sg_attr(attrs, key):
+    """取标签属性值：兼容单/双引号，属性顺序不限。"""
+    m = (re.search(r'\b%s\s*=\s*"([^"]*)"' % re.escape(key), attrs) or
+         re.search(r"\b%s\s*=\s*'([^']*)'" % re.escape(key), attrs))
+    return m.group(1) if m else ""
+
+def _sg_selects(body):
+    """解析一段 XML 里的 <select macro weight>（属性顺序无关）。"""
+    out = []
+    for s in re.finditer(r'<select\b([^>]*?)/?>', body, re.S):
+        macro = _sg_attr(s.group(1), "macro")
+        if macro:
+            out.append((macro, _sg_attr(s.group(1), "weight") or "100"))
+    return out
+
+def _sg_target_group(sel):
+    """从 <add sel="//groups/group[@name='X']"> 里取目标分组名。"""
+    m = re.search(r"\[\s*@name\s*=\s*(?:'([^']*)'|\"([^\"]*)\")\s*\]", sel or "")
+    return (m.group(1) or m.group(2)) if m else ""
+
 def _shipgroups():
     """合并原版+各 mod shipgroups.xml 的视图 {group: {source, selects:[(macro,weight)]}}。
-    后加载者覆盖同名 group（X4 文件级覆盖语义）。"""
+    按 X4 diff 语义兼容两种写法：
+      <add sel="//groups"><group name=...>...</group></add>      新建组
+      <add sel="//groups/group[@name='X']"><select .../></add>   追加到已有组
+    同名组的 select 按加载顺序累加，同一 macro 后写覆盖权重（不再整组覆盖）。"""
     out = {}
-    files = [("vanilla", os.path.join(ROOT, "libraries", "shipgroups.xml"))] +             [(m, os.path.join(ROOT, "extensions", m, "libraries", "shipgroups.xml")) for m in _ext_order()]
+    def put(name, src, sels, update_src=False):
+        if not name:
+            return
+        g = out.get(name)
+        if g is None:
+            out[name] = {"source": src, "selects": []}
+            g = out[name]
+        elif update_src:
+            g["source"] = src
+        pos = {m: i for i, (m, _w) in enumerate(g["selects"])}
+        for m, w in sels:
+            if m in pos:
+                g["selects"][pos[m]] = (m, w)
+            else:
+                pos[m] = len(g["selects"])
+                g["selects"].append((m, w))
+    files = [("vanilla", os.path.join(ROOT, "libraries", "shipgroups.xml"))] + \
+            [(m, os.path.join(ROOT, "extensions", m, "libraries", "shipgroups.xml")) for m in _ext_order()]
+    parsed = []
     for src, p in files:
         if not os.path.isfile(p):
             continue
@@ -2908,10 +3291,25 @@ def _shipgroups():
             txt = open(p, encoding="utf-8", errors="ignore").read()
         except Exception:
             continue
-        for m in re.finditer(r'<group\s+name="([^"]*)"[^>]*>(.*?)</group>', txt, re.S):
-            body = m.group(2)
-            sels = [(s.group(1), s.group(2)) for s in re.finditer(r'<select\s+macro="([^"]*)"\s+weight="([^"]*)"', body)]
-            out[m.group(1)] = {"source": src, "selects": sels}
+        parsed.append((src, txt, list(re.finditer(r'<add\b([^>]*)>(.*?)</add>', txt, re.S))))
+    # 第一遍：只落组定义，保证第二遍追加时目标组已存在
+    for src, txt, adds in parsed:
+        spans = [(a.start(), a.end()) for a in adds]
+        for a in adds:
+            if _sg_target_group(_sg_attr(a.group(1), "sel")):
+                continue   # 追加块内的 <group> 是历史畸形结构，游戏里同样无效，忽略
+            for gm in re.finditer(r'<group\b([^>]*)>(.*?)</group>', a.group(2), re.S):
+                put(_sg_attr(gm.group(1), "name"), src, _sg_selects(gm.group(2)), True)
+        for gm in re.finditer(r'<group\b([^>]*)>(.*?)</group>', txt, re.S):
+            if any(s <= gm.start() < e for s, e in spans):
+                continue
+            put(_sg_attr(gm.group(1), "name"), src, _sg_selects(gm.group(2)), True)
+    # 第二遍：追加到已有组的 select（目标组不存在时该 add 在游戏里不生效，视图同样不计）
+    for src, _txt, adds in parsed:
+        for a in adds:
+            gname = _sg_target_group(_sg_attr(a.group(1), "sel"))
+            if gname and gname in out:
+                put(gname, src, _sg_selects(a.group(2)))
     return out
 
 def ship_in_groups(ship_id):
@@ -2960,45 +3358,99 @@ def shipgroup_all():
     return [{"name": n, "source": g["source"], "count": len(g["selects"]), "zh": _shipgroup_zh(n)}
             for n, g in sorted(_shipgroups().items())]
 
-def shipgroup_save(d):
-    """把当前船加入目标 mod 的 shipgroups.xml（diff 覆盖）。
-    group 已存在(合并视图) → add select 到该 group；不存在 → 新建 group。返回修改文件列表。"""
-    ship_id = (d.get("ship") or "").strip()
-    group = (d.get("group") or "").strip()
-    if not ship_id or not group:
-        return {"ok": False, "error": "缺少船 id 或分组名"}
-    weight = str(d.get("weight") or "").strip() or "100"
-    mod = (d.get("target_mod") or MOD_DIR).strip()
-    macro = "%s_macro" % ship_id
-    existing = group in _shipgroups()
-    if existing:
-        block = '<select macro="%s" weight="%s"/>' % (macro, weight)
-        entry = '\t<add sel="//groups/group[@name=\'%s\']">\n\t\t%s\n\t</add>' % (group, block)
-    else:
-        block = '<group name="%s">\n\t\t<select macro="%s" weight="%s"/>\n\t</group>' % (group, macro, weight)
-        entry = '\t<add sel="//groups">\n\t\t%s\n\t</add>' % block
-    header = DIFF_HEADER
-    jp = os.path.join(mod, "libraries", "shipgroups.xml")
-    if os.path.isfile(jp):
-        txt = open(jp, encoding="utf-8").read()
-        # 去重：移除该 mod 文件里所有含该船宏的旧 add 块（加入或新建均适用）
-        for b in re.findall(r'<add\s+sel="//groups[^"]*"[^>]*>.*?</add>', txt, flags=re.S):
-            if macro in b:
-                txt = txt.replace(b, "")
-        txt = re.sub(r'[ \t]*\n\s*\n+', "\n", txt)
-        i = txt.rfind("</diff>")
-        if i >= 0:
-            txt = txt[:i] + entry + txt[i:]
-        else:
-            txt = txt.rstrip() + "\n" + entry + "\n"
-        open(jp, "w", encoding="utf-8").write(txt)
-    else:
-        open(jp, "w", encoding="utf-8").write(header + entry + "\n</diff>")
-    return {"ok": True, "modified": ["libraries\\shipgroups.xml"], "group": group, "macro": macro, "existing": existing}
+# ships.xml 里 UP7_EVE_battleship_xl/_l 条目按名引用这两个组，删空会导致
+# 右键生成表单里 EVE 舰船整体消失，因此清空 select 时保外壳不删块。
+_SG_RESERVED_GROUPS = ("UP7_EVE_battleship_xl_01", "UP7_EVE_battleship_l_01")
 
-def shipgroup_save_all(mod, ship_id, cfg):
-    """批量：把 ship 加入 cfg 指定的多个分组（写入 mod/libraries/shipgroups.xml diff）。
-    cfg={enabled, groups:[{group, weight}]}。返回修改文件相对路径列表。"""
+def _sg_strip_ship(txt, macro):
+    """精确移除该船 macro 的 <select>；某个 add 块删完已无 select 时整块移除
+    （顺带清掉历史遗留的空壳块与「group 套 group」畸形块），命名保留组除外。"""
+    pat = re.compile(r'[ \t]*<select\b[^>]*\bmacro\s*=\s*(?:"%s"|\'%s\')[^>]*/>[ \t]*\r?\n?'
+                     % (re.escape(macro), re.escape(macro)))
+    reserved = re.compile(r'<group\b[^>]*\bname\s*=\s*["\'](?:%s)["\']'
+                          % "|".join(map(re.escape, _SG_RESERVED_GROUPS)))
+    def _fix(m):
+        blk = m.group(0)
+        new = pat.sub("", blk)
+        if new == blk:
+            return blk
+        if reserved.search(new):
+            return new
+        return "" if not re.search(r'<select\b', new) else new
+    return re.sub(r'<add\b[^>]*>.*?</add>', _fix, txt, flags=re.S)
+
+def _sg_clean_empty(txt):
+    """清理空 add 块与删条目后留下的多余空行。"""
+    txt = re.sub(r'[ \t]*<add\b[^>]*>\s*</add>[ \t]*\r?\n?', "", txt)
+    return re.sub(r'[ \t]*\n\s*\n+', "\n", txt)
+
+def _shipsxml_sync(mod, ship_id, groups, factions, size):
+    """维护 ships.xml 中「仅属于本船 id」的 <ship group> 选择条目。
+    管理范围只限 id == 船id 或 id == 船id__分组，其它条目一律不动。
+    groups 为空时仅清理本船旧条目。返回修改文件相对路径或 None。"""
+    ship_id = (ship_id or "").strip()
+    if not ship_id:
+        return None
+    sp = os.path.join(mod, "libraries", "ships.xml")
+    exists = os.path.isfile(sp)
+    if not exists and not groups:
+        return None
+    txt = open(sp, encoding="utf-8", errors="ignore").read() if exists else ""
+    orig = txt
+    def _mine(attrs):
+        sid = _sg_attr(attrs, "id")
+        return sid == ship_id or sid.startswith(ship_id + "__")
+    txt = re.sub(r'<ship\b([^>]*)>.*?</ship>',
+                 lambda m: "" if _mine(m.group(1)) else m.group(0), txt, flags=re.S)
+    txt = re.sub(r'<ship\b([^>]*?)/>',
+                 lambda m: "" if _mine(m.group(1)) else m.group(0), txt)
+    ins = ""
+    if groups:
+        facs = [f for f in (factions or []) if f] or ["argon"]
+        size = (size or "l").lower()
+        blocks = []
+        used = set()
+        for i, group in enumerate(groups):
+            group = (group or "").strip()
+            if not group:
+                continue
+            sid = ship_id if i == 0 else "%s__%s" % (
+                ship_id, re.sub(r"[^A-Za-z0-9_]+", "_", group))
+            if sid in used:
+                continue
+            used.add(sid)
+            blocks.append(
+                '\t\t<ship id="%s" group="%s">\n'
+                '\t\t\t<category tags="[military, battleship, mission]" faction="[%s]" size="ship_%s"/>\n'
+                '\t\t\t<pilot>\n\t\t\t\t<select faction="%s" tags="fighterpilot"/>\n\t\t\t</pilot>\n'
+                '\t\t\t<drop ref="ship_large_military"/>\n'
+                '\t\t\t<people ref="argon_military_crew"/>\n'
+                '\t\t</ship>' % (sid, group, ",".join(facs), size, facs[0]))
+        ins = "\n".join(blocks)
+    if not txt.strip():
+        new = DIFF_HEADER + '\t<add sel="//ships">\n' + ins + '\n\t</add>\n</diff>\n'
+    else:
+        target = next((m for m in re.finditer(r'<add\b([^>]*)>(.*?)</add>', txt, re.S)
+                       if re.fullmatch(r"//ships/?", _sg_attr(m.group(1), "sel").strip())), None)
+        if target and ins:
+            k = target.end(2)
+            new = txt[:k].rstrip() + "\n" + ins + "\n\t" + txt[k:]
+        elif not ins or target:
+            new = txt
+        else:
+            block = '\t<add sel="//ships">\n' + ins + '\n\t</add>\n'
+            i = txt.rfind("</diff>")
+            new = (txt[:i] + block + txt[i:]) if i >= 0 else (txt.rstrip() + "\n" + block)
+    if new == orig:
+        return None
+    os.makedirs(os.path.dirname(sp), exist_ok=True)
+    write_text(sp, new)
+    return os.path.relpath(sp, mod)
+
+def shipgroup_save_all(mod, ship_id, cfg, faction="", size="", extra_factions=None):
+    """按 cfg 整体重写该船的 shipgroup 归属（可多分组）。
+    写 mod/libraries/shipgroups.xml（diff），并同步维护 ships.xml 中仅属于本船 id 的
+    <ship group=...> 条目。cfg={enabled, groups:[{group, weight}]}。返回修改文件列表。"""
     groups = cfg.get("groups") or []
     if not cfg.get("enabled") or not groups:
         return []
@@ -3008,11 +3460,15 @@ def shipgroup_save_all(mod, ship_id, cfg):
     macro = "%s_macro" % ship_id
     allg = _shipgroups()
     entries = []
+    wanted = []
     for g in groups:
         group = (g.get("group") or "").strip()
         weight = str(g.get("weight") or "").strip() or "100"
         if not group:
             continue
+        if group in wanted:
+            continue
+        wanted.append(group)
         if group in allg:
             entries.append('\t<add sel="//groups/group[@name=\'%s\']">\n\t\t<select macro="%s" weight="%s"/>\n\t</add>'
                            % (group, macro, weight))
@@ -3021,25 +3477,53 @@ def shipgroup_save_all(mod, ship_id, cfg):
                            % (group, macro, weight))
     if not entries:
         return []
-    body = "\n".join(entries)
+    mods = []
     jp = os.path.join(mod, "libraries", "shipgroups.xml")
+    os.makedirs(os.path.dirname(jp), exist_ok=True)
     if os.path.isfile(jp):
         txt = open(jp, encoding="utf-8").read()
-        # 去重：移除该 mod 文件里所有含该船宏的旧 add 块
-        for b in re.findall(r'<add\s+sel="//groups[^"]*"[^>]*>.*?</add>', txt, flags=re.S):
-            if macro in b:
-                txt = txt.replace(b, "")
-        txt = re.sub(r'[ \t]*\n\s*\n+', "\n", txt)
+        txt = _sg_clean_empty(_sg_strip_ship(txt, macro))
         i = txt.rfind("</diff>")
+        body = "\n".join(entries)
         if i >= 0:
             txt = txt[:i] + body + "\n" + txt[i:]
         else:
             txt = txt.rstrip() + "\n" + body + "\n"
-        open(jp, "w", encoding="utf-8").write(txt)
+        write_text(jp, txt)
     else:
-        header = DIFF_HEADER
-        open(jp, "w", encoding="utf-8").write(header + body + "\n</diff>")
-    return ["libraries\\shipgroups.xml"]
+        write_text(jp, DIFF_HEADER + "\n".join(entries) + "\n</diff>\n")
+    mods.append(os.path.relpath(jp, mod))
+    facs = []
+    for f in [faction] + list(extra_factions or []):
+        f = (f or "").strip()
+        if f and f not in facs:
+            facs.append(f)
+    rel = _shipsxml_sync(mod, ship_id, wanted, facs, size)
+    if rel:
+        mods.append(rel)
+    return mods
+
+def shipgroup_clear(mod, ship_id):
+    """清除该船在 shipgroups.xml 的 <select> 与 ships.xml 的本船条目（关闭 ⑥-1 / 删除船时用）。
+    返回修改文件相对路径列表。"""
+    ship_id = (ship_id or "").strip()
+    if not ship_id:
+        return []
+    macro = "%s_macro" % ship_id
+    out = []
+    jp = os.path.join(mod, "libraries", "shipgroups.xml")
+    if os.path.isfile(jp):
+        txt = open(jp, encoding="utf-8").read()
+        new = _sg_clean_empty(_sg_strip_ship(txt, macro))
+        if new != txt:
+            write_text(jp, new)
+            out.append(os.path.relpath(jp, mod))
+    sp = os.path.join(mod, "libraries", "ships.xml")
+    if os.path.isfile(sp):
+        rel = _shipsxml_sync(mod, ship_id, [], [], "")
+        if rel:
+            out.append(rel)
+    return out
 
 _LOADOUT_CACHE = None
 _MACRO_REF_RE = re.compile(r'<component\s+ref="([^"]+)"')
@@ -3161,6 +3645,40 @@ def _comp_geometry_id(comp):
         g = g[:-len("_data")]
     g = g.split("\\")[-1]
     return g
+
+def geo_owned(mod, rel_under_assets, comp_id):
+    """目标 mod 自有几何目录的显式路径。X4 只认 extensions\\<mod>\\assets\\... 写法：
+    mod 自有数据用裸 assets\\ 会被拒载 meshsource（实测）。
+    rel_under_assets 相对 assets 的目录，comp_id 为数据目录对应 id（不含 _data）。"""
+    rel = (rel_under_assets or "").replace("/", "\\").strip("\\")
+    tail = ("\\" + rel) if rel else ""
+    owner = os.path.basename(os.path.normpath(mod))
+    return "extensions\\%s\\assets%s\\%s_data" % (owner, tail, comp_id)
+
+def geo_rebase(geom, dst_owner, src_id="", dst_id="", src_size="", dst_size=""):
+    """把 <source geometry> 改归属到目标 mod 的显式路径：
+    assets\\... / extensions\\<任意mod>\\assets\\... → extensions\\<dst_owner>\\assets\\...
+    仅当最后一段目录名恰为 <src_id>_data 时改名为 <dst_id>_data，其余段原样保留。
+    指定 src_size/dst_size 时，同时把路径中的 size_<旧尺寸> 段改成 size_<新尺寸>
+    （L 模板生成 XL 船时数据目录已复制到 size_xl，几何路径必须同步）。"""
+    g = (geom or "").replace("/", "\\").strip()
+    if not g:
+        return g
+    parts = [p for p in g.split("\\") if p]
+    low = [p.lower() for p in parts]
+    rel = parts[low.index("assets") + 1:] if "assets" in low else parts
+    if rel and src_id and dst_id and rel[-1] == src_id + "_data":
+        rel[-1] = dst_id + "_data"
+    if src_size and dst_size and src_size.lower() != dst_size.lower():
+        for i, p in enumerate(rel):
+            if p.lower() == "size_" + src_size.lower():
+                rel[i] = "size_" + dst_size.lower()
+    owner = (dst_owner or "").strip("\\")
+    if not owner:
+        return "\\".join(rel)
+    if not rel:
+        return "extensions\\%s\\assets" % owner
+    return "extensions\\%s\\assets\\%s" % (owner, "\\".join(rel))
 
 def _comp_tags_sizes(comp, type_words):
     """读装备 component，只统计含类型词(engine/shield/turret/weapon)的 connection tags，
@@ -3660,7 +4178,7 @@ def write_loadout(mod, mac_name, ld, size):
             return []
         txt = re.sub(r'\s*<loadout id="default">.*?</loadout>', '', txt, count=1, flags=re.S)
         txt = re.sub(r'\s*<loadouts>\s*</loadouts>', '', txt, flags=re.S)
-        open(ship_mac, "w", encoding="utf-8").write(txt)
+        write_text(ship_mac, txt)
         return [os.path.relpath(ship_mac, mod)]
     macros = []
     def mrow(tag, macro, path, opt):
@@ -3705,7 +4223,7 @@ def write_loadout(mod, mac_name, ld, size):
         m = re.search(r'<macro[^>]*>', txt)
         if not m: return []
         txt = txt[:m.end()] + '\n\t\t<loadouts>\n\t\t\t' + body + '\n\t\t</loadouts>' + txt[m.end():]
-    open(ship_mac, "w", encoding="utf-8").write(txt)
+    write_text(ship_mac, txt)
     return [os.path.relpath(ship_mac, mod)]
 
 def write_ware(mod, cid, mac_name, size, faction, d, tids):
@@ -3758,28 +4276,17 @@ def write_ware(mod, cid, mac_name, size, faction, d, tids):
     return os.path.relpath(jp, mod)
 
 def update_registry(mod, comp_name, mac_name, stor_id, new_da, faction, size, name, d, tids):
-    """更新 wares / shipgroups / t / index 注册文件。返回修改的文件相对路径。"""
+    """更新 wares / t / index 注册文件。返回修改的文件相对路径。"""
     modified = []
     nid  = comp_name
     name_en = d.get("name_en") or (name.upper())
     name_zh = d.get("name_zh") or name.title()
     desc_zh= d.get("desc_zh") or ("EVE舰船 %s" % name.title())
     desc_en= d.get("desc_en") or ("EVE ship %s" % name.title())
-    group = "UP7_EVE_battleship_%s_01" % ("xl" if size=="xl" else "l")
     # 建造成本：界面可自定义（cost），留空按尺寸套默认档；已有该 ship 则替换，无则追加
     ware_rel = write_ware(mod, comp_name, mac_name, size, faction, d, tids)
     if ware_rel: modified.append(ware_rel)
     jobs_cfg = d.get("jobs") or {}
-
-    def insert_add(path, text):
-        """在 <add sel=...> 块末尾（</add> 前）插入新条目。"""
-        if not os.path.isfile(path): return False
-        txt = open(path, encoding="utf-8").read()
-        i = txt.rfind("</add>")
-        if i < 0: return False
-        txt = txt[:i] + text + "\n\t\t" + txt[i:]
-        open(path,"w",encoding="utf-8").write(txt)
-        return True
 
     # jobs：AI 派系主动使用（派系 × 任务）
     if jobs_cfg.get("enabled"):
@@ -3787,24 +4294,6 @@ def update_registry(mod, comp_name, mac_name, stor_id, new_da, faction, size, na
 
     # 装配预设：生成 loadout（写入该船 ship macro 内联 loadout id="default"，默认/AI/船厂生成生效）
     modified += write_loadout(mod, mac_name, d.get("loadout") or {}, size)
-
-    # shipgroups
-    sg_p = os.path.join(mod,"libraries","shipgroups.xml")
-    sg_xml = '\n\t\t\t<select macro="%s" weight="20"/>' % mac_name
-    # 插入到对应 group 的最后一个 </select> 之后、</group> 前
-    if os.path.isfile(sg_p):
-        txt = open(sg_p, encoding="utf-8").read()
-        j = txt.find('group name="%s"' % group)
-        if j < 0:
-            # group 不存在则新建
-            j2 = txt.rfind("</add>")
-            newgrp = ('\n\t\t<group name="%s">\n\t\t\t<select macro="%s" weight="20"/>\n\t\t</group>') % (group, mac_name)
-            txt = txt[:j2].rstrip() + newgrp + "\n\t\t" + txt[j2:]
-        else:
-            k = txt.find("</group>", j)
-            txt = txt[:k].rstrip() + sg_xml + "\n\t\t" + txt[k:]
-        open(sg_p,"w",encoding="utf-8").write(txt)
-        modified.append(os.path.relpath(sg_p, mod))
 
     # t 名称（中文 + 英文）
     zh_p, en_p = _loc_files(mod)
@@ -3818,24 +4307,19 @@ def update_registry(mod, comp_name, mac_name, stor_id, new_da, faction, size, na
         ins = ("\n\t\t\t<t id=\"%d\">%s</t>\n\t\t\t<t id=\"%d\">%s</t>\n\t\t\t<t id=\"%d\">%s</t>" %
                (tids[0],n, tids[1],desc, tids[2],desc))
         txt = txt[:k].rstrip() + ins + txt[k:]
-        open(tp,"w",encoding="utf-8").write(txt)
+        write_text(tp, txt)
         modified.append(os.path.relpath(tp, mod))
 
-    # index/macros.xml（entry 路径按目标 mod 目录名动态拼接，不硬编码 UP7）
-    im_p = os.path.join(mod,"index","macros.xml")
-    modn = os.path.basename(mod)
-    im_txt = '\n\t\t\t<entry name="%s" value="extensions\\%s\\assets\\units\\size_%s\\macros\\%s"/>' % (mac_name, modn, size, mac_name)
-    im_txt += '\n\t\t\t<entry name="%s" value="extensions\\%s\\assets\\units\\size_%s\\macros\\%s"/>' % (stor_id, modn, size, stor_id)
+    # index/macros.xml + components.xml（统一走 register_assets，路径自动按目标 mod 目录名拼接）
+    idx_items = [
+        ("macros", mac_name, "units\\size_%s\\macros\\%s" % (size, mac_name)),
+        ("macros", stor_id, "units\\size_%s\\macros\\%s" % (size, stor_id)),
+        ("components", comp_name, "units\\size_%s\\%s" % (size, comp_name)),
+    ]
     if new_da:
-        im_txt += '\n\t\t\t<entry name="%s_macro" value="extensions\\%s\\assets\\structures\\dock\\macros\\%s_macro"/>' % (new_da, modn, new_da)
-    if insert_add(im_p, im_txt): modified.append(os.path.relpath(im_p, mod))
-
-    # index/components.xml
-    ic_p = os.path.join(mod,"index","components.xml")
-    ic_txt = '\n\t\t\t<entry name="%s" value="extensions\\%s\\assets\\units\\size_%s\\%s"/>' % (comp_name, modn, size, comp_name)
-    if new_da:
-        ic_txt += '\n\t\t\t<entry name="%s" value="extensions\\%s\\assets\\structures\\dock\\%s"/>' % (new_da, modn, new_da)
-    if insert_add(ic_p, ic_txt): modified.append(os.path.relpath(ic_p, mod))
+        idx_items.append(("macros", new_da + "_macro", "structures\\dock\\macros\\%s_macro" % new_da))
+        idx_items.append(("components", new_da, "structures\\dock\\%s" % new_da))
+    modified += register_assets(mod, idx_items)
 
     return {"files": modified}
 
@@ -3847,6 +4331,90 @@ EQUIP_CLASSES = {
     "missile": {"label": "导弹",   "grp": "missiles", "tg": "equipment missile", "lic": "",                    "sizes": []},
     "bullet":  {"label": "弹丸", "grp": "", "tg": "equipment bullet", "lic": "", "sizes": []},
     "engine":  {"label": "引擎", "grp": "engines", "tg": "equipment engine", "lic": "generaluseequipment", "sizes": ["small", "medium", "large", "extralarge"]},
+}
+# 装备字段单一数据源：key = 前端字段名，tag = macro 内元素名，attr = 元素属性名。
+# _read_equip_fields / _apply_equip_fields 都只遍历这张表；结构特殊、无法用「tag+attr」表达的
+# 字段（bullet 引用、engine ref/曲线、missile 属性组、bullet reload.time 等）在各函数内显式处理。
+_EQ_FIELDS = {
+    "engine": [
+        ("boost_duration", "boost", "duration"), ("boost_recharge", "boost", "recharge"),
+        ("boost_thrust", "boost", "thrust"), ("boost_acceleration", "boost", "acceleration"),
+        ("boost_attack", "boost", "attack"), ("boost_release", "boost", "release"),
+        ("boost_coast", "boost", "coast"),
+        ("travel_charge", "travel", "charge"), ("travel_thrust", "travel", "thrust"),
+        ("travel_attack", "travel", "attack"), ("travel_release", "travel", "release"),
+        ("thrust_forward", "thrust", "forward"), ("thrust_reverse", "thrust", "reverse"),
+        ("thrust_strafe", "thrust", "strafe"), ("thrust_pitch", "thrust", "pitch"),
+        ("thrust_yaw", "thrust", "yaw"), ("thrust_roll", "thrust", "roll"),
+        ("hull_max", "hull", "max"), ("hull_threshold", "hull", "threshold"),
+        ("integrated", "hull", "integrated"), ("glow_dynamic", "glow", "dynamic"),
+    ],
+    "shield": [
+        ("hull", "hull", "max"), ("hull_threshold", "hull", "threshold"),
+        ("recharge_max", "recharge", "max"), ("recharge_rate", "recharge", "rate"),
+        ("recharge_delay", "recharge", "delay"), ("disruption", "recharge", "disruptionstability"),
+        ("integrated", "hull", "integrated"),
+    ],
+    "turret": [
+        ("rot_speed", "rotationspeed", "max"), ("rot_accel", "rotationacceleration", "max"),
+        ("hull", "hull", "max"), ("hull_threshold", "hull", "threshold"),
+        ("integrated", "hull", "integrated"), ("weapon_angle", "weapon", "angle"),
+        ("storage", "storage", "capacity"),
+    ],
+    "weapon": [
+        ("overheat", "heat", "overheat"), ("cooldelay", "heat", "cooldelay"),
+        ("overheatcd", "heat", "overheatcooldelay"), ("coolrate", "heat", "coolrate"),
+        ("reenable", "heat", "reenable"),
+        ("rot_speed", "rotationspeed", "max"), ("rot_accel", "rotationacceleration", "max"),
+        ("hull", "hull", "max"), ("integrated", "hull", "integrated"),
+        ("weapon_angle", "weapon", "angle"), ("weapon_shotangle", "weapon", "shotangle"),
+        ("hittable", "hull", "hittable"), ("storage", "storage", "capacity"),
+        ("zoom_delay", "zoom", "delay"), ("zoom_factor", "zoom", "factor"),
+        ("zoom_time", "zoom", "time"),
+    ],
+    "missile": [
+        ("ammo", "ammunition", "value"), ("ammo_reload", "ammunition", "reload"),
+        ("explosion", "explosiondamage", "value"),
+        ("explosion_shield", "explosiondamage", "shield"),
+        ("explosion_shielddisruption", "explosiondamage", "shielddisruption"),
+        ("explosion_hull", "explosiondamage", "hull"),
+        ("reload", "reload", "time"), ("hull", "hull", "max"),
+        ("countermeasure", "countermeasure", "resilience"), ("mass", "physics", "mass"),
+        ("lock_time", "lock", "time"), ("lock_range", "lock", "range"),
+        ("acc_reverse", "accfactors", "reverse"),
+        ("angle", "missile", "angle"), ("icon", "missile", "icon"),
+        ("in_pitch", "inertia", "pitch"), ("in_yaw", "inertia", "yaw"), ("in_roll", "inertia", "roll"),
+        ("dr_forward", "drag", "forward"), ("dr_reverse", "drag", "reverse"),
+        ("dr_horizontal", "drag", "horizontal"), ("dr_vertical", "drag", "vertical"),
+        ("dr_pitch", "drag", "pitch"), ("dr_yaw", "drag", "yaw"), ("dr_roll", "drag", "roll"),
+    ],
+    "bullet": [
+        ("speed", "bullet", "speed"), ("lifetime", "bullet", "lifetime"),
+        ("amount", "bullet", "amount"), ("barrelamount", "bullet", "barrelamount"),
+        ("delay", "bullet", "delay"), ("icon", "bullet", "icon"),
+        ("angle", "bullet", "angle"), ("maxhits", "bullet", "maxhits"),
+        ("ricochet", "bullet", "ricochet"),
+        ("ammo_cap", "ammunition", "value"), ("ammo_reload", "ammunition", "reload"),
+        ("reload_rate", "reload", "rate"), ("heat", "heat", "value"),
+        ("damage", "damage", "value"), ("shielddisruption", "damage", "shielddisruption"),
+        ("damage_shield", "damage", "shield"), ("repair", "damage", "repair"),
+        ("damage_hull", "damage", "hull"),
+        ("timediff", "bullet", "timediff"), ("scale", "bullet", "scale"),
+        ("attach", "bullet", "attach"), ("range", "bullet", "range"),
+        ("influencelist", "bullet", "influencelist"),
+        ("restitution", "bullet", "restitution"), ("bullet_mass", "bullet", "mass"),
+        ("chargetime", "bullet", "chargetime"), ("firewhenfullcharge", "bullet", "firewhenfullcharge"),
+        ("requirefullcharge", "bullet", "requirefullcharge"), ("heatwhilecharging", "bullet", "heatwhilecharging"),
+        ("selfdestruct", "bullet", "selfdestruct"), ("plannedselfdestruct", "bullet", "plannedselfdestruct"),
+        ("selfdestructmintime", "bullet", "selfdestructmintime"),
+        ("selfdestructtimediff", "bullet", "selfdestructtimediff"),
+        ("sticktime", "bullet", "sticktime"),
+        ("heat_initial", "heat", "initial"), ("damage_delay", "damage", "delay"),
+        ("area_shield", "areadamage", "shield"),
+        ("mult_traveldrive", "multiplier", "traveldrive"), ("mult_mining", "multiplier", "mining"),
+        ("mult_surface", "multiplier", "surfaceelement"),
+        ("area_dmg", "areadamage", "value"), ("area_lifetime", "areadamage", "lifetime"),
+    ],
 }
 _EQ_SCAN_CACHE = None
 _EQ_DUP_CACHE = None
@@ -4026,7 +4594,7 @@ def _bullet_scan_fxdir(fx_root, src, seen):
                                    _read_comp_txt(comp))
                     if gm:
                         geo = gm.group(1)
-                except Exception:
+                except OSError:
                     pass
         seen[(hid, src)] = {"id": hid, "path": p2, "cls": "bullet", "source": src,
                      "kind": kind, "size": size, "geometry": geo, "ref": ref, "ref_source": _ref_comp_source(comp, ref)}
@@ -4161,19 +4729,9 @@ def _read_equip_fields(cls, mtxt):
     def num(tag, name):
         m = re.search(r'<%s\b[^>]*%s="([^"]*)"' % (tag, name), mtxt)
         return m.group(1) if m else ""
+    for key, tag, attr in _EQ_FIELDS.get(cls, []):
+        f[key] = num(tag, attr)
     if cls == "engine":
-        for k, tg, an in (("boost_duration","boost","duration"),("boost_recharge","boost","recharge"),
-                          ("boost_thrust","boost","thrust"),("boost_acceleration","boost","acceleration"),
-                          ("boost_attack","boost","attack"),("boost_release","boost","release"),
-                          ("boost_coast","boost","coast"),
-                          ("travel_charge","travel","charge"),("travel_thrust","travel","thrust"),
-                          ("travel_attack","travel","attack"),("travel_release","travel","release"),
-                          ("thrust_forward","thrust","forward"),("thrust_reverse","thrust","reverse"),
-                          ("thrust_strafe","thrust","strafe"),("thrust_pitch","thrust","pitch"),
-                          ("thrust_yaw","thrust","yaw"),("thrust_roll","thrust","roll"),
-                          ("hull_max","hull","max"),("hull_threshold","hull","threshold"),
-                          ("integrated","hull","integrated"),("glow_dynamic","glow","dynamic")):
-            f[k] = num(tg, an)
         def _rref(tg):
             m = re.search(r'<%s\s+ref="([^"]*)"' % tg, mtxt)
             return m.group(1) if m else ""
@@ -4188,83 +4746,30 @@ def _read_equip_fields(cls, mtxt):
                             for p in re.finditer(r'<point\s+position="([^"]*)"\s+value="([^"]*)"', m.group(1)))
         f["decel_pts"] = _rpts("decelerationcurve")
         f["strafe_pts"] = _rpts("strafecurve")
-    elif cls == "shield":
-        f["hull"] = num("hull", "max"); f["hull_threshold"] = num("hull", "threshold")
-        f["recharge_max"] = num("recharge", "max"); f["recharge_rate"] = num("recharge", "rate")
-        f["recharge_delay"] = num("recharge", "delay"); f["disruption"] = num("recharge", "disruptionstability")
-        f["integrated"] = num("hull", "integrated")
     elif cls == "turret":
         m = re.search(r'<bullet\s+class="([^"]*)"', mtxt)
         _fb = m.group(1) if m else ""
         if _fb.endswith("_macro"): _fb = _fb[:-6]
         f["bullet"] = _fb
-        f["rot_speed"] = num("rotationspeed", "max"); f["rot_accel"] = num("rotationacceleration", "max")
-        f["hull"] = num("hull", "max"); f["hull_threshold"] = num("hull", "threshold")
-        f["integrated"] = num("hull", "integrated"); f["weapon_angle"] = num("weapon", "angle")
-        # 导弹发射塔(missileturret)专用：弹药类别 + 弹药舱容量
+        # 导弹发射塔(missileturret)专用：弹药类别（容量走通用表）
         mm = re.search(r'<ammunition\s+tags="([^"]*)"', mtxt); f["ammo_tags"] = mm.group(1) if mm else ""
-        f["storage"] = num("storage", "capacity")
     elif cls == "weapon":
         m = re.search(r'<bullet\s+class="([^"]*)"', mtxt)
         _fb = m.group(1) if m else ""
         if _fb.endswith("_macro"): _fb = _fb[:-6]
         f["bullet"] = _fb
-        f["overheat"] = num("heat", "overheat"); f["cooldelay"] = num("heat", "cooldelay")
-        f["overheatcd"] = num("heat", "overheatcooldelay"); f["coolrate"] = num("heat", "coolrate")
-        f["reenable"] = num("heat", "reenable")
-        f["rot_speed"] = num("rotationspeed", "max"); f["rot_accel"] = num("rotationacceleration", "max")
-        f["hull"] = num("hull", "max"); f["integrated"] = num("hull", "integrated")
-        f["weapon_angle"] = num("weapon", "angle"); f["hittable"] = num("hull", "hittable")
-        f["weapon_shotangle"] = num("weapon", "shotangle")
-        f["storage"] = num("storage", "capacity")
+        # 发射类武器专用：弹药类别（其余数值走通用表）
         mm = re.search(r'<ammunition\s+tags="([^"]*)"', mtxt); f["ammo_tags"] = mm.group(1) if mm else ""
-        f["zoom_delay"] = num("zoom", "delay"); f["zoom_factor"] = num("zoom", "factor")
-        f["zoom_time"] = num("zoom", "time")
     elif cls == "missile":
+        # missile 标签自身属性组：不是 tag+attr 结构，显式读写
         m = re.search(r'<missile\b([^>]*)>', mtxt); a = m.group(1) if m else ""
-        for k in ("amount", "barrelamount", "lifetime", "range", "guided", "retarget", "tags", "angle", "icon",
+        for k in ("amount", "barrelamount", "lifetime", "range", "guided", "retarget", "tags",
                   "timediff", "swarm", "targetable", "influencelist"):
             mm = re.search(r'%s="([^"]*)"' % k, a); f[k] = mm.group(1) if mm else ""
-        f["ammo"] = num("ammunition", "value"); f["ammo_reload"] = num("ammunition", "reload")
-        f["explosion"] = num("explosiondamage", "value"); f["explosion_shield"] = num("explosiondamage", "shield")
-        f["explosion_shielddisruption"] = num("explosiondamage", "shielddisruption")
-        f["explosion_hull"] = num("explosiondamage", "hull")
-        f["reload"] = num("reload", "time"); f["hull"] = num("hull", "max")
         mm = re.search(r'<weapon\s+system="([^"]*)"', mtxt); f["weapon_system"] = mm.group(1) if mm else ""
-        f["countermeasure"] = num("countermeasure", "resilience")
-        f["lock_time"] = num("lock", "time"); f["lock_range"] = num("lock", "range")
-        mm = re.search(r'<accfactors\b[^>]*reverse="([^"]*)"', mtxt); f["acc_reverse"] = mm.group(1) if mm else ""
-        f["mass"] = num("physics", "mass")
-        for axis in ("pitch", "yaw", "roll"):
-            mm = re.search(r'<inertia\b[^>]*%s="([^"]*)"' % axis, mtxt); f["in_%s" % axis] = mm.group(1) if mm else ""
-        for ax in ("forward", "reverse", "horizontal", "vertical", "pitch", "yaw", "roll"):
-            mm = re.search(r'<drag\b[^>]*%s="([^"]*)"' % ax, mtxt); f["dr_%s" % ax] = mm.group(1) if mm else ""
     elif cls == "bullet":
-        for t, a, k in (("bullet","speed","speed"),("bullet","lifetime","lifetime"),
-                        ("bullet","amount","amount"),("bullet","barrelamount","barrelamount"),
-                        ("bullet","delay","delay"),("bullet","icon","icon"),
-                        ("bullet","angle","angle"),("bullet","maxhits","maxhits"),
-                        ("bullet","ricochet","ricochet"),
-                        ("ammunition","value","ammo_cap"),("ammunition","reload","ammo_reload"),
-                        ("reload","rate","reload_rate"),("heat","value","heat"),
-                        ("damage","value","damage"),("damage","shielddisruption","shielddisruption"),
-                        ("damage","shield","damage_shield"),("damage","repair","repair"),
-                        ("damage","hull","damage_hull"),
-                        ("bullet","timediff","timediff"),("bullet","scale","scale"),
-                        ("bullet","attach","attach"),("bullet","range","range"),
-                        ("bullet","influencelist","influencelist"),
-                        ("bullet","restitution","restitution"),("bullet","mass","bullet_mass"),
-                        ("bullet","chargetime","chargetime"),("bullet","firewhenfullcharge","firewhenfullcharge"),
-                        ("bullet","requirefullcharge","requirefullcharge"),("bullet","heatwhilecharging","heatwhilecharging"),
-                        ("bullet","selfdestruct","selfdestruct"),("bullet","plannedselfdestruct","plannedselfdestruct"),
-                        ("bullet","selfdestructmintime","selfdestructmintime"),("bullet","selfdestructtimediff","selfdestructtimediff"),
-                        ("bullet","sticktime","sticktime"),
-                        ("reload","time","reload_time"),("heat","initial","heat_initial"),
-                        ("damage","delay","damage_delay"),("areadamage","shield","area_shield"),
-                        ("multiplier","traveldrive","mult_traveldrive"),("multiplier","mining","mult_mining"),
-                        ("multiplier","surfaceelement","mult_surface"),
-                        ("areadamage","value","area_dmg"),("areadamage","lifetime","area_lifetime")):
-            mm = re.search(r'<%s\b[^>]*%s="([^"]*)"' % (t, a), mtxt); f[k] = mm.group(1) if mm else ""
+        # reload.time 与 reload.rate 互斥，不走通用表（见 apply 特殊分支）
+        f["reload_time"] = num("reload", "time")
         dm = re.search(r'<damagecurves>(.*?)</damagecurves>', mtxt, re.S)
         f["dmgcurve_pts"] = (";".join("%s:%s" % (p.group(1), p.group(2))
                              for p in re.finditer(r'<point\s+position="([^"]*)"\s+value="([^"]*)"', dm.group(1)))) if dm else ""
@@ -4299,19 +4804,9 @@ def _apply_equip_fields(cls, mtxt, f):
         return re.sub(r'(<bullet\s+class=")[^"]*(")', r'\g<1>%s\g<2>' % (v + suf), mtxt, count=1)
     def app(r):
         return r if r is not None else mtxt
+    for key, tag, attr in _EQ_FIELDS.get(cls, []):
+        mtxt = app(setnum(tag, attr, key))
     if cls == "engine":
-        for k, tg, an in (("boost_duration","boost","duration"),("boost_recharge","boost","recharge"),
-                          ("boost_thrust","boost","thrust"),("boost_acceleration","boost","acceleration"),
-                          ("boost_attack","boost","attack"),("boost_release","boost","release"),
-                          ("boost_coast","boost","coast"),
-                          ("travel_charge","travel","charge"),("travel_thrust","travel","thrust"),
-                          ("travel_attack","travel","attack"),("travel_release","travel","release"),
-                          ("thrust_forward","thrust","forward"),("thrust_reverse","thrust","reverse"),
-                          ("thrust_strafe","thrust","strafe"),("thrust_pitch","thrust","pitch"),
-                          ("thrust_yaw","thrust","yaw"),("thrust_roll","thrust","roll"),
-                          ("hull_max","hull","max"),("hull_threshold","hull","threshold"),
-                          ("integrated","hull","integrated"),("glow_dynamic","glow","dynamic")):
-            mtxt = app(setnum(tg, an, k))
         def setnamed(par, child, key):
             if key not in f:
                 return mtxt
@@ -4349,20 +4844,9 @@ def _apply_equip_fields(cls, mtxt, f):
         mtxt = app(setnamed("sounds", "enginedetail", "sound_detail"))
         mtxt = app(setpts("decelerationcurve", "decel_pts"))
         mtxt = app(setpts("strafecurve", "strafe_pts"))
-    elif cls == "shield":
-        for k, tg, an in (("hull","hull","max"),("hull_threshold","hull","threshold"),
-                          ("integrated","hull","integrated"),
-                          ("recharge_max","recharge","max"),("recharge_rate","recharge","rate"),
-                          ("recharge_delay","recharge","delay"),("disruption","recharge","disruptionstability")):
-            mtxt = app(setnum(tg, an, k))
     elif cls == "turret":
         mtxt = app(setbul("bullet"))
-        for k, tg, an in (("rot_speed","rotationspeed","max"),("rot_accel","rotationacceleration","max"),
-                          ("hull","hull","max"),
-                          ("hull_threshold","hull","threshold"),("integrated","hull","integrated"),
-                          ("weapon_angle","weapon","angle")):
-            mtxt = app(setnum(tg, an, k))
-        # 导弹发射塔(missileturret)专用：弹药类别 tags + 弹药舱容量（空值删除，普通炮塔无影响）
+        # 导弹发射塔(missileturret)专用：弹药类别 tags（空值删除，普通炮塔无影响）
         if "ammo_tags" in f:
             v = (f.get("ammo_tags") or "").strip()
             amm = re.search(r'<ammunition\b[^>]*>', mtxt)
@@ -4374,19 +4858,8 @@ def _apply_equip_fields(cls, mtxt, f):
                         mtxt = mtxt.replace(amm.group(0), amm.group(0)[:-1] + ' tags="%s">' % v, 1)
                 else:
                     mtxt = re.sub(r'(<ammunition\b[^>]*?)\s+tags="[^"]*"', r'\g<1>', mtxt, count=1)
-        mtxt = app(setnum("storage", "capacity", "storage"))
     elif cls == "weapon":
         mtxt = app(setbul("bullet"))
-        for k, tg, an in (("overheat","heat","overheat"),("cooldelay","heat","cooldelay"),
-                          ("overheatcd","heat","overheatcooldelay"),("coolrate","heat","coolrate"),
-                          ("reenable","heat","reenable"),("rot_speed","rotationspeed","max"),
-                          ("rot_accel","rotationacceleration","max"),("hull","hull","max"),
-                          ("integrated","hull","integrated"),
-                          ("weapon_angle","weapon","angle"),("weapon_shotangle","weapon","shotangle"),
-                          ("hittable","hull","hittable"),("storage","storage","capacity"),
-                          ("zoom_delay","zoom","delay"),("zoom_factor","zoom","factor"),
-                          ("zoom_time","zoom","time")):
-            mtxt = app(setnum(tg, an, k))
         # 发射类武器专用：弹药类别 tags（空值删除，普通武器无影响）
         if "ammo_tags" in f:
             v = (f.get("ammo_tags") or "").strip()
@@ -4409,49 +4882,9 @@ def _apply_equip_fields(cls, mtxt, f):
                                   lambda m: m.group(1) + v + m.group(2), mtxt, count=1)
                 else:
                     mtxt = re.sub(r'\s%s="[^"]*"' % k, "", mtxt, count=1)
-        for k, tg, an in (("ammo","ammunition","value"),("ammo_reload","ammunition","reload"),
-                          ("explosion","explosiondamage","value"),
-                          ("explosion_shield","explosiondamage","shield"),
-                          ("explosion_shielddisruption","explosiondamage","shielddisruption"),
-                          ("explosion_hull","explosiondamage","hull"),
-                          ("reload","reload","time"),("hull","hull","max"),
-                          ("countermeasure","countermeasure","resilience"),("mass","physics","mass"),
-                          ("lock_time","lock","time"),("lock_range","lock","range"),
-                          ("acc_reverse","accfactors","reverse"),
-                          ("angle","missile","angle"),("icon","missile","icon")):
-            mtxt = app(setnum(tg, an, k))
-        for axis in ("pitch","yaw","roll"):
-            mtxt = app(setnum("inertia", axis, "in_"+axis))
-        for ax in ("forward","reverse","horizontal","vertical","pitch","yaw","roll"):
-            mtxt = app(setnum("drag", ax, "dr_"+ax))
         if "weapon_system" in f and (f.get("weapon_system") or "").strip():
             mtxt = re.sub(r'(<weapon\s+system=")[^"]*(")', r'\g<1>%s\g<2>' % (f.get("weapon_system") or "").strip(), mtxt, count=1)
     elif cls == "bullet":
-        for k, tg, an in (("speed","bullet","speed"),("lifetime","bullet","lifetime"),
-                          ("amount","bullet","amount"),("barrelamount","bullet","barrelamount"),
-                          ("delay","bullet","delay"),("icon","bullet","icon"),
-                          ("angle","bullet","angle"),("maxhits","bullet","maxhits"),
-                          ("ricochet","bullet","ricochet"),
-                          ("ammo_cap","ammunition","value"),("ammo_reload","ammunition","reload"),
-                          ("reload_rate","reload","rate"),("heat","heat","value"),
-                          ("damage","damage","value"),("shielddisruption","damage","shielddisruption"),
-                          ("damage_shield","damage","shield"),("repair","damage","repair"),
-                          ("damage_hull","damage","hull"),
-                          ("timediff","bullet","timediff"),("scale","bullet","scale"),
-                          ("attach","bullet","attach"),("range","bullet","range"),
-                          ("influencelist","bullet","influencelist"),
-                          ("restitution","bullet","restitution"),("bullet_mass","bullet","mass"),
-                          ("chargetime","bullet","chargetime"),("firewhenfullcharge","bullet","firewhenfullcharge"),
-                          ("requirefullcharge","bullet","requirefullcharge"),("heatwhilecharging","bullet","heatwhilecharging"),
-                          ("selfdestruct","bullet","selfdestruct"),("plannedselfdestruct","bullet","plannedselfdestruct"),
-                          ("selfdestructmintime","bullet","selfdestructmintime"),("selfdestructtimediff","bullet","selfdestructtimediff"),
-                          ("sticktime","bullet","sticktime"),
-                          ("heat_initial","heat","initial"),("damage_delay","damage","delay"),
-                          ("area_shield","areadamage","shield"),
-                          ("mult_traveldrive","multiplier","traveldrive"),("mult_mining","multiplier","mining"),
-                          ("mult_surface","multiplier","surfaceelement"),
-                          ("area_dmg","areadamage","value"),("area_lifetime","areadamage","lifetime")):
-            mtxt = app(setnum(tg, an, k))
         # 装填时间模式 reload.time（与 reload.rate 互斥；仅当模板已有 time 时改写，避免双模式冲突）
         if (f.get("reload_time") or "").strip():
             mtxt = re.sub(r'(<reload\b[^>]*?time=")[^"]*(")',
@@ -4508,7 +4941,7 @@ def _alloc_tids(mod):
                         v = int(m.group(1))
                         if v > maxid:
                             maxid = v
-                except Exception:
+                except OSError:
                     pass
     return [maxid+1, maxid+2]
 
@@ -4635,7 +5068,7 @@ def _write_mod_icon(mod, icon_name, texture):
         if i < 0:
             return None
         t = t[:i].rstrip() + "\n" + ent + "\n\t" + t[i:]
-    open(fp, "w", encoding="utf-8", newline="").write(t)
+    write_text(fp, t, newline="")
     return os.path.relpath(fp, mod)
 
 def _remove_mod_icon(mod, icon_name):
@@ -4647,7 +5080,7 @@ def _remove_mod_icon(mod, icon_name):
     nt = re.sub(r'[ \t]*<icon\s+name="%s"[^>]*/>[ \t]*\n' % re.escape(icon_name), '', t)
     nt = re.sub(r"\n(?:[ \t]+\n)+", "\n", nt)
     if nt != t:
-        open(fp, "w", encoding="utf-8", newline="").write(nt)
+        write_text(fp, nt, newline="")
         return os.path.relpath(fp, mod)
     return None
 
@@ -4906,7 +5339,7 @@ def _write_equip_txt(mod, eid, d, name_tid, desc_tid):
             else:
                 pg = pg.rstrip() + '\n\t\t\t<t id="%d">%s</t>' % (tid, val_esc)
         txt = txt[:j] + pg + txt[k:]
-        open(tp, "w", encoding="utf-8").write(txt)
+        write_text(tp, txt)
         modi.append(os.path.relpath(tp, mod))
     if modi:
         # 语言表缓存失效：新增/改名装备后，让回填能解析到新写的 t id
@@ -4916,10 +5349,12 @@ def _write_equip_txt(mod, eid, d, name_tid, desc_tid):
             pass
     return modi
 
-def _register_index(mod, items):
-    """把新资产追加注册到 mod/index/<kind>.xml（kind=macros/components）。
-    items: [(kind, entry_name, relpath_without_ext)]，value 用反斜杠路径。"""
+def register_assets(mod, items):
+    """把新资产注册到 mod/index/<kind>.xml（kind 即 macros / components，对应文件名）。
+    items: [(kind, entry_name, rel_under_assets)]，rel_under_assets 相对 assets 目录，
+    自动补 extensions\\<mod>\\assets\\ 前缀；同名条目先删后加（幂等）。返回实际写入的文件相对路径。"""
     modi = []
+    owner = os.path.basename(mod)
     for kind, name, rel in items:
         fp = os.path.join(mod, "index", kind + ".xml")
         if not os.path.isfile(fp):
@@ -4930,9 +5365,9 @@ def _register_index(mod, items):
         i = t.rfind("</add>")
         if i < 0:
             continue
-        val = "extensions\\%s\\%s" % (os.path.basename(mod), rel.replace("/", "\\"))
+        val = "extensions\\%s\\assets\\%s" % (owner, (rel or "").replace("/", "\\").strip("\\"))
         t = t[:i].rstrip() + "\n\t\t\t" + '<entry name="%s" value="%s"/>' % (name, val) + t[i:]
-        open(fp, "w", encoding="utf-8").write(t)
+        write_text(fp, t)
         try:
             modi.append(os.path.relpath(fp, mod))
         except ValueError:
@@ -4941,33 +5376,12 @@ def _register_index(mod, items):
 
 def _register_equip(mod, cls, eid, rel):
     """注册 index/macros.xml + components.xml。rel = 相对 props 的目录（如 WeaponSystems/standard）。"""
-    modi = []
-    mac_val = "extensions\\%s\\assets\\props\\%s\\macros\\%s_macro" % (os.path.basename(mod), rel.replace("/", "\\"), eid)
-    comp_val = "extensions\\%s\\assets\\props\\%s\\%s" % (os.path.basename(mod), rel.replace("/", "\\"), eid)
-    im = os.path.join(mod, "index", "macros.xml")
-    ic = os.path.join(mod, "index", "components.xml")
-    if os.path.isfile(im):
-        t = open(im, encoding="utf-8").read()
-        t = re.sub(r'<entry name="%s_macro"[^>]*/>' % re.escape(eid), '', t)
-        t = re.sub(r"\n(?:[ \t]+\n)+", "\n", t)   # 收尾：压掉清旧条目留下的纯空白孤儿行
-        i = t.rfind("</add>")
-        if i >= 0:
-            t = t[:i].rstrip() + '\n\t\t\t<entry name="%s_macro" value="%s"/>' % (eid, mac_val) + t[i:]
-            open(im, "w", encoding="utf-8").write(t)
-            modi.append(os.path.relpath(im, mod))
-    if os.path.isfile(ic):
-        t0 = open(ic, encoding="utf-8").read()
-        t = re.sub(r'<entry name="%s"[^>]*/>' % re.escape(eid), '', t0)
-        t = re.sub(r"\n(?:[ \t]+\n)+", "\n", t)   # 收尾：压掉清旧条目留下的纯空白孤儿行
-        # 组件文件确实落盘才注册 components 条目（引用原版/DLC 模型且未填自定义 tags 时不落组件文件），避免悬空引用
-        if os.path.isfile(os.path.join(mod, "assets", "props", rel, eid + ".xml")):
-            i = t.rfind("</add>")
-            if i >= 0:
-                t = t[:i].rstrip() + '\n\t\t\t<entry name="%s" value="%s"/>' % (eid, comp_val) + t[i:]
-        if t != t0:
-            open(ic, "w", encoding="utf-8").write(t)
-            modi.append(os.path.relpath(ic, mod))
-    return modi
+    rel = rel.replace("/", "\\").strip("\\")
+    items = [("macros", eid + "_macro", "props\\%s\\macros\\%s_macro" % (rel, eid))]
+    # 组件文件确实落盘才注册 components 条目（引用原版/DLC 模型且未填自定义 tags 时不落组件文件），避免悬空引用
+    if os.path.isfile(os.path.join(mod, "assets", "props", rel, eid + ".xml")):
+        items.append(("components", eid, "props\\%s\\%s" % (rel, eid)))
+    return register_assets(mod, items)
 
 def _shield_visual(comp):
     """读护盾组件视觉：材质引用（material ref，hulltexture/fx/涂装等）+ 动画部件（animations）。
@@ -5176,7 +5590,7 @@ def equip_read(cls, eid, source="", mod=""):
             "trail_name": trail_name, "trail_type": trail_type, "explosion_ref": explosion_ref,
             "mt_class": mt_class, "visual": visual}
 
-def _copy_dir_rename(src, dst, old, new):
+def _copy_dir_rename(src, dst, old, new, warns=None):
     """递归复制 data 目录，并把目录内：子文件夹名、文件名、文件内容里所有 old→new 全部改名。
     顺序：先改内容（旧名仍可读），再改文件名/文件夹名；XML 解析失败时内容仍用文本替换兜底。"""
     shutil.copytree(src, dst, dirs_exist_ok=True)
@@ -5188,8 +5602,9 @@ def _copy_dir_rename(src, dst, old, new):
                 c = open(fp, "rb").read()
                 if old.encode("utf-8") in c:
                     open(fp, "wb").write(c.replace(old.encode("utf-8"), new.encode("utf-8")))
-            except Exception:
-                pass
+            except OSError as e:      # 单个文件改名写入失败：继续处理其余文件，但要让调用方知道
+                if warns is not None:
+                    warns.append("模型数据文件改名失败（%s）：%s" % (os.path.basename(fp), e))
         for d in dirs:
             dp = os.path.join(r, d)
             if old in d:
@@ -5450,7 +5865,7 @@ def _all_xsd_schemas():
     return result
 
 
-def _copy_rename_asset(src_comp_dir, src_id, dst_comp_dir, new_id, conn_tags="", conn_name=""):
+def _copy_rename_asset(src_comp_dir, src_id, dst_comp_dir, new_id, conn_tags="", conn_name="", warns=None):
     """整套复制一个装备资产并彻底改名：component + _data 目录 + _data.ani。
     - 组件内容 src_id→new_id 全局替换（文本替换覆盖 text+attrib，天然无解析失败）
     - data 目录内子文件夹名/文件名/文件内容全部 src_id→new_id
@@ -5473,11 +5888,17 @@ def _copy_rename_asset(src_comp_dir, src_id, dst_comp_dir, new_id, conn_tags="",
         src_data = os.path.join(src_comp_dir, src_id + "_data")
         data_ready = False
         if os.path.isdir(src_data):
+            dst_data = os.path.join(dst_comp_dir, new_id + "_data")
+            data_existed = os.path.exists(dst_data)
             try:
-                created.append(_copy_dir_rename(src_data, os.path.join(dst_comp_dir, new_id + "_data"), src_id, new_id))
+                _copy_dir_rename(src_data, dst_data, src_id, new_id, warns=warns)
                 data_ready = True
-            except (OSError, shutil.Error):
-                pass
+                if not data_existed:      # 已存在的目录不纳入 created，避免回滚误删用户原有文件
+                    created.append(dst_data)
+                    _tx_note_new(dst_data)
+            except (OSError, shutil.Error) as e:
+                if warns is not None:
+                    warns.append("模型 data 目录复制失败，已回退共享模板数据：%s" % e)
         if src_id in ctxt:
             ctxt = ctxt.replace(src_id, new_id)
             if not data_ready:
@@ -5487,19 +5908,24 @@ def _copy_rename_asset(src_comp_dir, src_id, dst_comp_dir, new_id, conn_tags="",
             # 全局改名后会指向 src 侧不存在的新名目录 / 引擎不解析的裸路径 → meshsource 拒载（x150 同类坑）。
             m = re.match(r'(.*?)[/\\]assets[/\\](.*)$', dst_comp_dir)
             if m:
-                geo = "extensions\\%s\\assets\\%s\\%s_data" % (
-                    os.path.basename(m.group(1)), m.group(2).replace("/", "\\"), new_id)
-                ctxt = re.sub(r'geometry="[^"]*"', 'geometry="%s"' % geo, ctxt)
+                geo = geo_owned(m.group(1), m.group(2), new_id)
+                ctxt = re.sub(r'geometry="[^"]*"', lambda mm: 'geometry="%s"' % geo, ctxt)
         if conn_tags:
             ctxt = _set_mount_tags(ctxt, conn_tags, conn_name)
         os.makedirs(dst_comp_dir, exist_ok=True)
         dp = os.path.join(dst_comp_dir, new_id + ".xml")
-        open(dp, "w", encoding="utf-8").write(ctxt)
-        created.append(dp); copied = True
+        dp_existed = os.path.exists(dp)
+        write_text(dp, ctxt)
+        if not dp_existed:
+            created.append(dp)
+        copied = True
         src_ani = os.path.join(src_comp_dir, src_id + "_data.ani")
         if os.path.isfile(src_ani):
             adp = os.path.join(dst_comp_dir, new_id + "_data.ani")
-            shutil.copy2(src_ani, adp); created.append(adp)
+            adp_existed = os.path.exists(adp)
+            shutil.copy2(src_ani, adp)
+            if not adp_existed:
+                created.append(adp)
     return created, copied
 
 def _resolve_eq_ref(cls, ref):
@@ -5515,6 +5941,7 @@ def _resolve_eq_ref(cls, ref):
             return ref, x
     return None
 
+@_txn
 def equip_generate(d):
     cls = d.get("cls")
     if cls not in EQUIP_CLASSES:
@@ -5522,6 +5949,9 @@ def equip_generate(d):
     new_id = (d.get("new_id") or "").strip().lower()
     if not re.match(r'^[a-z][a-z0-9_]*$', new_id):
         return {"ok": False, "error": "装备 ID 格式错误，应用小写字母/数字/下划线，如 shield_arg_xl_01_mk1"}
+    # ID 存在性校验（与舰船 generate 对齐）：同 class 已有同名宏 → 拒绝，避免覆盖既有装备
+    if new_id in (equip_scan().get(cls) or {}):
+        return {"ok": False, "error": "装备ID已存在：%s（同 id 会覆盖已有宏与组件，请换一个）" % new_id}
     tpl_raw = (d.get("template") or "")
     _ti = tpl_raw.rfind("@@")
     tpl_id = tpl_raw[:_ti] if _ti > 0 else tpl_raw
@@ -5560,8 +5990,33 @@ def equip_generate(d):
     rel = os.path.relpath(src_comp_dir, _eq_props_dir(mref["source"]))
     dst_comp_dir = os.path.join(mod, "assets", "props", rel)
     dst_mac_dir = os.path.join(dst_comp_dir, "macros")
+    # 目标 mod 已存在同名宏/组件（缓存可能未刷新）→ 同样拒绝，避免覆盖用户已有文件
+    if os.path.isfile(os.path.join(dst_mac_dir, new_id + "_macro.xml")) or \
+            os.path.isfile(os.path.join(dst_comp_dir, new_id + ".xml")):
+        return {"ok": False, "error": "装备ID已存在：%s（目标 mod 已有同名宏/组件，请换一个）" % new_id}
+    # 尾焰/爆炸特效预校验：先校验后落盘，避免 macro/component 已写、特效创建失败留下半成品
+    _tf0 = d.get("fields") or {}
+    if cls == "missile":
+        if str(_tf0.get("trail_new") or "").lower() in ("1", "true", "yes", "on"):
+            _rt, _nt = (_tf0.get("trail_ref_type") or "").strip(), (_tf0.get("trail_new_type") or "").strip().lower()
+            if not _rt or not _nt or not re.match(r'^[a-z][a-z0-9_]*$', _nt):
+                return {"ok": False, "error": "缺少参考尾焰特效/新尾焰名（小写字母/数字/下划线）"}
+            if not _find_trail_effect(_rt)[0]:
+                return {"ok": False, "error": "参考尾焰特效 %s 未找到" % _rt}
+            if vanilla_ref and not (d.get("conn_tags") or "").strip():
+                return {"ok": False, "error": "该模板复用原版组件，无法写入尾焰引用；请填写自定义挂载点以复制组件"}
+        if str(_tf0.get("explosion_new") or "").lower() in ("1", "true", "yes", "on"):
+            _et = (_tf0.get("explosion_new_type") or "").strip()
+            _er = (_tf0.get("explosion_ref") or "").strip()
+            if not _et or not re.match(r'^[a-z0-9_]+$', _et):
+                return {"ok": False, "error": "爆炸特效名须为小写字母/数字/下划线"}
+            if not _find_explosion_effect(_et)[0] and not _er:
+                return {"ok": False, "error": "缺少参考爆炸特效（复制需选参考）"}
+            if _er and not _find_explosion_effect(_er)[0]:
+                return {"ok": False, "error": "找不到参考爆炸特效 %s" % _er}
     os.makedirs(dst_mac_dir, exist_ok=True)
     created, modified = [], []
+    _warns = []          # 写入过程中的可恢复问题（模型复制/改名失败等），随结果返回前端
     def wrel(p):
         return os.path.relpath(p, mod)
     # 1. 复制 component + data + ani 改名。
@@ -5572,7 +6027,7 @@ def equip_generate(d):
     conn_name = (d.get("conn_name") or "").strip()
     if not vanilla_ref:
         src_id = model_ref            # component ref 物品 id（组件文件名），非宏 id
-        cre, copied = _copy_rename_asset(src_comp_dir, src_id, dst_comp_dir, new_id, conn_tags, conn_name)
+        cre, copied = _copy_rename_asset(src_comp_dir, src_id, dst_comp_dir, new_id, conn_tags, conn_name, warns=_warns)
         created += [wrel(p) for p in cre]
         if not copied:
             comp_ref = model_ref   # 该装备无自有组件（复用官方/其他），回退直接指回，不复制
@@ -5586,7 +6041,7 @@ def equip_generate(d):
             ctxt = _set_mount_tags(ctxt, conn_tags, conn_name)
             os.makedirs(dst_comp_dir, exist_ok=True)
             dp = os.path.join(dst_comp_dir, new_id + ".xml")
-            open(dp, "w", encoding="utf-8").write(ctxt)
+            write_text(dp, ctxt)
             created.append(wrel(dp))
             comp_ref = new_id
     # 1.5 护盾视觉（材质引用/动画部件）：写复制后的 new_id 组件
@@ -5596,8 +6051,9 @@ def equip_generate(d):
         if os.path.isfile(_nc):
             _c2 = open(_nc, encoding="utf-8", errors="ignore").read()
             _c2 = _apply_shield_visual(_c2, vis)
-            open(_nc, "w", encoding="utf-8").write(_c2)
-            created.append(wrel(_nc))
+            write_text(_nc, _c2)
+            if wrel(_nc) not in created:   # 仅记录本次新建（原件保留不计入回滚）
+                created.append(wrel(_nc))
     # 2. 写 macro properties
     mtxt = open(src_mac, encoding="utf-8", errors="ignore").read()
     mtxt = mtxt.replace('name="%s_macro"' % tpl["id"], 'name="%s_macro"' % new_id)
@@ -5609,7 +6065,7 @@ def equip_generate(d):
     name_tid, desc_tid = _alloc_tids(mod)
     mtxt = _rewrite_ident_tids(mtxt, name_tid, desc_tid)
     mdp = os.path.join(dst_mac_dir, new_id + "_macro.xml")
-    open(mdp, "w", encoding="utf-8").write(mtxt)
+    write_text(mdp, mtxt)
     created.append(wrel(mdp))
     # 3. t 文本
     modified += _write_equip_txt(mod, new_id, d, name_tid, desc_tid)
@@ -5642,6 +6098,7 @@ def equip_generate(d):
                               "new_type": (_tf.get("trail_new_type") or "").strip(),
                               "params": _tf.get("trail_params") or {}})
             if not tb.get("ok"):
+                _rollback_created(mod, (tb.get("created") or []) + created)
                 return {"ok": False, "error": tb.get("error")}
             for _c in tb.get("created") or []:
                 if _c not in created:
@@ -5654,11 +6111,12 @@ def equip_generate(d):
                                   "new_type": (_tf.get("explosion_new_type") or "").strip(),
                                   "macro_path": mdp})
             if not eb.get("ok"):
+                _rollback_created(mod, (eb.get("created") or []) + created)
                 return {"ok": False, "error": eb.get("error")}
             for _c in eb.get("created") or []:
                 if _c not in created:
                     created.append(_c)
-    warns = verify_model_refs(mod, dst_comp_p) if os.path.isfile(dst_comp_p) else []
+    warns = _warns + (verify_model_refs(mod, dst_comp_p) if os.path.isfile(dst_comp_p) else [])
     eq_cache_refresh_source(mod)  # 装备缓存增量维护：仅重扫本 mod props 合并回缓存（免全盘冷扫）
     _refresh_soft()               # t文本+wares索引+组件内容缓存失效（中英文名回填即时）
     return {"ok": True, "id": new_id, "cls": cls, "created": created, "modified": modified,
@@ -5678,6 +6136,29 @@ def _backup_before_edit(path, tag):
         return bd
     except Exception:
         return ""
+
+def write_text(path, text, backup_tag="", newline=None):
+    """原子写文本：同目录临时文件写完再 os.replace 覆盖，避免中途失败留下半截 XML。
+    backup_tag 非空时先备份原文件（沿用 _backup_before_edit 的备份区）。
+    失败抛 OSError，由调用方决定回滚或转告警；返回写入路径。"""
+    if backup_tag:
+        _backup_before_edit(path, backup_tag)
+    _tx_record(path)      # 事务内：覆盖前快照原内容，失败可恢复
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".wtx_", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return path
 
 def equip_edit(d):
     cls = d.get("cls")
@@ -5718,7 +6199,7 @@ def equip_edit(d):
     mtxt = _rewrite_ident_tids(mtxt, name_tid, desc_tid)
     if not _backup_before_edit(src_mac, "equip_" + cls):   # 先备份再覆盖（空值=删属性不可逆）
         return {"ok": False, "error": "备份失败，已中止写入: %s" % src_mac}
-    open(src_mac, "w", encoding="utf-8").write(mtxt)
+    write_text(src_mac, mtxt)
     try:
         modified = [os.path.relpath(src_mac, mod)]
     except ValueError:      # 跨盘（罕见）：改用绝对路径
@@ -5732,7 +6213,7 @@ def equip_edit(d):
             ct = open(comp, encoding="utf-8", errors="ignore").read()
             nct = _set_mount_tags(ct, conn_tags, conn_name)
             if nct != ct and _backup_before_edit(comp, "equipcomp_" + cls):
-                open(comp, "w", encoding="utf-8").write(nct)
+                write_text(comp, nct)
                 try:
                     modified.append(os.path.relpath(comp, mod))
                 except ValueError:
@@ -5745,7 +6226,7 @@ def equip_edit(d):
             _c2 = open(_comp2, encoding="utf-8", errors="ignore").read()
             _c2 = _apply_shield_visual(_c2, vis)
             if _backup_before_edit(_comp2, "equipcomp_" + cls):
-                open(_comp2, "w", encoding="utf-8").write(_c2)
+                write_text(_comp2, _c2)
                 try:
                     modified.append(os.path.relpath(_comp2, mod))
                 except ValueError:
@@ -5846,12 +6327,13 @@ def bullet_generate(d):
     vanilla_ref = (mref["source"] == "vanilla") or mref["source"].startswith("ego_dlc_")
     comp_ref = model_ref if vanilla_ref else new_id
     created = []
+    _warns = []          # 弹丸组件复制/改名中的可恢复问题，随结果返回前端
     def wrel(p): return os.path.relpath(p, mod)
     # mod 引用：复制该弹丸 component + data + ani 一套，改名 new_id
     if not vanilla_ref:
         comp_dir = os.path.dirname(os.path.dirname(mref["path"]))   # .../assets/fx/weaponFx
         dst_comp_dir = os.path.join(mod, "assets", "fx", "weaponFx")
-        cre, copied = _copy_rename_asset(comp_dir, model_ref, dst_comp_dir, new_id)  # 组件文件名=物品 id
+        cre, copied = _copy_rename_asset(comp_dir, model_ref, dst_comp_dir, new_id, warns=_warns)  # 组件文件名=物品 id
         created += [wrel(p) for p in cre]
         if not copied:
             comp_ref = model_ref   # 该弹丸无自有组件（复用官方/其他），回退直接指回，不复制
@@ -5862,19 +6344,19 @@ def bullet_generate(d):
     dst_dir = os.path.join(mod, "assets", "fx", "weaponFx", "macros")
     os.makedirs(dst_dir, exist_ok=True)
     mdp = os.path.join(dst_dir, new_id + "_macro.xml")
-    open(mdp, "w", encoding="utf-8").write(mtxt)
+    write_text(mdp, mtxt)
     created.append(wrel(mdp))
     # index 注册（macros + 若有新 component）：游戏经 index 索引识别新资产，必须注册，否则不生效
     modified = []
-    idx = [("macros", new_id + "_macro", "assets/fx/weaponFx/macros/" + new_id + "_macro")]
+    idx = [("macros", new_id + "_macro", "fx/weaponFx/macros/" + new_id + "_macro")]
     comp_path = os.path.join(mod, "assets", "fx", "weaponFx", new_id + ".xml")
     if os.path.isfile(comp_path):
-        idx.append(("components", new_id, "assets/fx/weaponFx/" + new_id))
-    modified += _register_index(mod, idx)
+        idx.append(("components", new_id, "fx/weaponFx/" + new_id))
+    modified += register_assets(mod, idx)
     copy_to_moding(mod, created + modified)
     # 复制改名后模型引用完整性抽查（只读，不阻断）
     bcp = os.path.join(mod, "assets", "fx", "weaponFx", new_id + ".xml")
-    warns = verify_model_refs(mod, bcp) if os.path.isfile(bcp) else []
+    warns = _warns + (verify_model_refs(mod, bcp) if os.path.isfile(bcp) else [])
     bullet_cache_refresh_source(mod)  # 弹丸缓存增量维护：仅重扫本 mod fx/weaponFx 合并回缓存（免全盘冷扫）
     _refresh_soft()                   # t文本+wares索引+组件内容缓存失效
     return {"ok": True, "id": new_id, "created": created, "modified": modified, "moding": os.path.join(mod, "moding"), "warnings": warns}
@@ -5904,7 +6386,7 @@ def bullet_edit(d):
     mtxt = _apply_equip_fields("bullet", mtxt, d.get("fields") or {})
     if not _backup_before_edit(it["path"], "bullet"):   # 先备份再覆盖（空值=删属性不可逆）
         return {"ok": False, "error": "备份失败，已中止写入: %s" % it["path"]}
-    open(it["path"], "w", encoding="utf-8").write(mtxt)
+    write_text(it["path"], mtxt)
     try:
         modified = [os.path.relpath(it["path"], mod)]
     except ValueError:
@@ -6255,6 +6737,44 @@ def _set_explosion_ref(mtxt, new_ref):
     """把宏 <effects> 内首个 <explosion ref="X"/> 换成 new_ref；无则不换。"""
     return re.sub(r'<explosion\s+ref="[^"]*"', '<explosion ref="' + new_ref + '"', mtxt, count=1)
 
+def upsert_effect(tmod, body, filename="effects.xml", name=""):
+    """把 <effect> 块并入目标 mod 的 libraries/<filename>，返回相对路径。
+    name 已存在则原地替换（更新模式）；否则追加进 <add sel="//effects">（无则补建）。"""
+    dst_dir = os.path.join(tmod, "libraries")
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, filename)
+    existing = ""
+    if os.path.isfile(dst):
+        existing = open(dst, encoding="utf-8", errors="ignore").read()
+    body = body.strip()
+    if name and existing:
+        pat = re.compile(r'<effect\s+name="%s"[^>]*>.*?</effect>' % re.escape(name), re.S)
+        if pat.search(existing):
+            write_text(dst, pat.sub(lambda m: body, existing, count=1), newline="")
+            return os.path.relpath(dst, tmod)
+    if not existing:
+        newtxt = DIFF_HEADER + '  <add sel="//effects">\n    ' + body + '\n  </add>\n</diff>\n'
+    else:
+        am = re.search(r'(?s)(<add sel="//effects"[^>]*>)(.*?)(</add>)', existing)
+        if am:
+            # 追加到现有 add 块末尾；保留已写入的其他特效（原实现会整块覆盖，第二个特效会吃掉第一个）
+            newtxt = existing[:am.start(3)].rstrip() + "\n    " + body + "\n  " + existing[am.start(3):]
+        else:
+            # 兼容旧格式（裸 <diff>）与新格式（<diff xmlns:xsi=...>）：定位 diff 开标签后插入
+            newtxt = re.sub(r'<diff\b[^>]*>',
+                            lambda m: m.group(0) + '\n  <add sel="//effects">\n    ' + body + '\n  </add>',
+                            existing, count=1)
+    write_text(dst, newtxt, newline="")
+    return os.path.relpath(dst, tmod)
+
+
+def finish_write(tmod, created):
+    """统一的写后收尾：同步到 moding + 弹丸缓存增量维护 + 轻量失效。失败不再静默吞掉。"""
+    copy_to_moding(mod=tmod, items=created)
+    bullet_cache_refresh_source(tmod)  # 弹丸缓存增量维护（免全盘冷扫）
+    _refresh_soft()                    # 材质/视觉参考等轻量失效
+
+
 def explosion_build(d):
     eid = (d.get("eid") or "").strip()
     tmod = os.path.normpath(d.get("target_mod") or MOD_DIR)
@@ -6273,24 +6793,19 @@ def explosion_build(d):
         try:
             if ('name="' + new_type + '"' in open(dst0, encoding="utf-8", errors="ignore").read()):
                 t_exists = True
-        except Exception:
+        except OSError:
             pass
     if gblk or t_exists:
         if macp and os.path.isfile(macp):
             mt = open(macp, encoding="utf-8", errors="ignore").read()
             nmt = _set_explosion_ref(mt, new_type)
             if nmt != mt:
-                open(macp, "w", encoding="utf-8").write(nmt)
+                write_text(macp, nmt)
                 try:
                     created = [os.path.relpath(macp, tmod)]
                 except ValueError:
                     created = [macp]
-                try:
-                    copy_to_moding(mod=tmod, items=created)
-                    bullet_cache_refresh_source(tmod)  # 弹丸缓存增量维护（免全盘冷扫）
-                    _refresh_soft()                    # 材质/视觉参考等轻量失效
-                except Exception:
-                    pass
+                finish_write(tmod, created)
                 return {"ok": True, "new_type": new_type, "created": created, "src": gsrc, "mode": "ref"}
             return {"ok": True, "new_type": new_type, "created": [], "src": gsrc, "mode": "ref"}
         return {"ok": False, "error": "找不到宏文件以写入爆炸引用"}
@@ -6306,50 +6821,26 @@ def explosion_build(d):
     if refs:
         new_blk = re.sub(r'<reference\s+effect="' + re.escape(refs[0]) + r'"',
                          '<reference effect="' + new_ent + '"', new_blk, count=1)
-    dst_dir = os.path.join(tmod, "libraries")
-    os.makedirs(dst_dir, exist_ok=True)
-    dst = os.path.join(dst_dir, "effects.xml")
     ent_blk = ""
     if refs:
         ent_blk, _s = _find_explosion_effect(refs[0])
         ent_blk = ent_blk.replace('name="' + refs[0] + '"', 'name="' + new_ent + '"', 1)
-    existing = ""
-    if os.path.isfile(dst):
-        existing = open(dst, encoding="utf-8", errors="ignore").read()
     body = new_blk
     if ent_blk:
         body += "\n" + ent_blk
-    indent = "\n    "
-    if not existing:
-        newtxt = DIFF_HEADER + '  <add sel="//effects">' + indent + body.strip() + '\n  </add>\n</diff>\n'
-    else:
-        am = re.search(r'(?s)(<add sel="//effects"[^>]*>)(.*?)(</add>)', existing)
-        if am:
-            newtxt = existing[:am.start(2)] + "\n    " + body.strip() + "\n  " + existing[am.start(3):]
-        else:
-            # 兼容旧格式（裸 <diff>）与新格式（<diff xmlns:xsi=...>）：定位 diff 开标签后插入
-            newtxt = re.sub(r'<diff\b[^>]*>',
-                            lambda m: m.group(0) + '\n  <add sel="//effects">' + indent + body.strip() + '\n  </add>',
-                            existing, count=1)
-    open(dst, "w", encoding="utf-8").write(newtxt)
-    created = [os.path.relpath(dst, tmod)]
+    created = [upsert_effect(tmod, body)]
     if macp and os.path.isfile(macp):
         mt = open(macp, encoding="utf-8", errors="ignore").read()
         nmt = _set_explosion_ref(mt, new_type)
         if nmt != mt:
-            open(macp, "w", encoding="utf-8").write(nmt)
+            write_text(macp, nmt)
             try:
                 created.append(os.path.relpath(macp, tmod))
             except ValueError:
                 created.append(macp)
     else:
         return {"ok": False, "error": "找不到宏文件以写入爆炸引用"}
-    try:
-        copy_to_moding(mod=tmod, items=created)
-        bullet_cache_refresh_source(tmod)  # 弹丸缓存增量维护（免全盘冷扫）
-        _refresh_soft()                    # 材质/视觉参考等轻量失效
-    except Exception:
-        pass
+    finish_write(tmod, created)
     return {"ok": True, "new_type": new_type, "created": created, "src": src, "mode": "copy"}
 
 
@@ -6447,24 +6938,19 @@ def bullet_effect_build(d):
         try:
             if ('name="' + new_type + '"' in open(dst0, encoding="utf-8", errors="ignore").read()):
                 t_exists = True
-        except Exception:
+        except OSError:
             pass
     if gblk or t_exists:
         if macp and os.path.isfile(macp):
             mt = open(macp, encoding="utf-8", errors="ignore").read()
             nmt = _set_bullet_effect_ref(mt, tag, new_type)
             if nmt != mt:
-                open(macp, "w", encoding="utf-8").write(nmt)
+                write_text(macp, nmt)
                 try:
                     created = [os.path.relpath(macp, tmod)]
                 except ValueError:
                     created = [macp]
-                try:
-                    copy_to_moding(mod=tmod, items=created)
-                    bullet_cache_refresh_source(tmod)  # 弹丸缓存增量维护（免全盘冷扫）
-                    _refresh_soft()                    # 材质/视觉参考等轻量失效
-                except Exception:
-                    pass
+                finish_write(tmod, created)
                 return {"ok": True, "new_type": new_type, "created": created, "src": gsrc, "mode": "ref"}
             return {"ok": True, "new_type": new_type, "created": [], "src": gsrc, "mode": "ref"}
         return {"ok": False, "error": "找不到宏文件以写入特效引用"}
@@ -6480,50 +6966,26 @@ def bullet_effect_build(d):
     if refs:
         new_blk = re.sub(r'<reference\s+effect="' + re.escape(refs[0]) + r'"',
                          '<reference effect="' + new_ent + '"', new_blk, count=1)
-    dst_dir = os.path.join(tmod, "libraries")
-    os.makedirs(dst_dir, exist_ok=True)
-    dst = os.path.join(dst_dir, "effects.xml")
     ent_blk = ""
     if refs:
         ent_blk, _s = _find_explosion_effect(refs[0])
         ent_blk = ent_blk.replace('name="' + refs[0] + '"', 'name="' + new_ent + '"', 1)
-    existing = ""
-    if os.path.isfile(dst):
-        existing = open(dst, encoding="utf-8", errors="ignore").read()
     body = new_blk
     if ent_blk:
         body += "\n" + ent_blk
-    indent = "\n    "
-    if not existing:
-        newtxt = DIFF_HEADER + '  <add sel="//effects">' + indent + body.strip() + '\n  </add>\n</diff>\n'
-    else:
-        am = re.search(r'(?s)(<add sel="//effects"[^>]*>)(.*?)(</add>)', existing)
-        if am:
-            newtxt = existing[:am.start(2)] + "\n    " + body.strip() + "\n  " + existing[am.start(3):]
-        else:
-            # 兼容旧格式（裸 <diff>）与新格式（<diff xmlns:xsi=...>）：定位 diff 开标签后插入
-            newtxt = re.sub(r'<diff\b[^>]*>',
-                            lambda m: m.group(0) + '\n  <add sel="//effects">' + indent + body.strip() + '\n  </add>',
-                            existing, count=1)
-    open(dst, "w", encoding="utf-8").write(newtxt)
-    created = [os.path.relpath(dst, tmod)]
+    created = [upsert_effect(tmod, body)]
     if macp and os.path.isfile(macp):
         mt = open(macp, encoding="utf-8", errors="ignore").read()
         nmt = _set_bullet_effect_ref(mt, tag, new_type)
         if nmt != mt:
-            open(macp, "w", encoding="utf-8").write(nmt)
+            write_text(macp, nmt)
             try:
                 created.append(os.path.relpath(macp, tmod))
             except ValueError:
                 created.append(macp)
     else:
         return {"ok": False, "error": "找不到宏文件以写入特效引用"}
-    try:
-        copy_to_moding(mod=tmod, items=created)
-        bullet_cache_refresh_source(tmod)  # 弹丸缓存增量维护（免全盘冷扫）
-        _refresh_soft()                    # 材质/视觉参考等轻量失效
-    except Exception:
-        pass
+    finish_write(tmod, created)
     return {"ok": True, "new_type": new_type, "created": created, "src": src, "mode": "copy"}
 
 
@@ -6563,7 +7025,7 @@ def bullet_trail_materials():
             fp = os.path.join(ROOT, "extensions", m, "libraries", "material_library.xml")
             if os.path.isfile(fp):
                 files.append(fp)
-    except Exception:
+    except OSError:
         pass
     by_id = {}
     for fp in files:
@@ -6642,13 +7104,13 @@ def bullet_trail_build(d):
             sm = re.search(r'<material\s+id="1"\s+ref="([^"]+)"', sh.group(0)) if sh else None
             if sm and _bullet_mat_bare(sm.group(1)) == material:
                 return {"ok": True, "created": [], "unchanged": True, "material": material}
-        except Exception:
+        except OSError:
             pass
     tgt = os.path.join(tmod, "assets", "fx", "weaponFx", eid + ".xml")
     if not os.path.isfile(tgt):
         os.makedirs(os.path.dirname(tgt), exist_ok=True)
         # diff 补丁型源组件先合并 base 再写入（直接复制 <diff> 原文游戏无法加载）
-        open(tgt, "w", encoding="utf-8").write(_read_comp_txt(comp))
+        write_text(tgt, _read_comp_txt(comp))
     t2 = open(tgt, encoding="utf-8", errors="ignore").read()
     nt = t2
     if material:
@@ -6669,14 +7131,9 @@ def bullet_trail_build(d):
                 b = re.sub(r'(<key\s+frame="(?!1")[^"]*"\s+value=")[^"]*(")', r'\g<1>' + uv[ek] + r'\g<2>', b, count=1)
             return b
         nt = pat.sub(rep, nt, count=1)
-    open(tgt, "w", encoding="utf-8", newline="").write(nt)
+    write_text(tgt, nt, newline="")
     created = [os.path.relpath(tgt, tmod)]
-    try:
-        copy_to_moding(mod=tmod, items=created)
-        bullet_cache_refresh_source(tmod)  # 弹丸缓存增量维护（免全盘冷扫）
-        _refresh_soft()                    # 材质/视觉参考等轻量失效
-    except Exception:
-        pass
+    finish_write(tmod, created)
     return {"ok": True, "created": created, "material": material, "uv": uv}
 def bullet_beam_materials():
     """光束弹丸可用材质：material_library（原版+扩展）中含 beam / p2_bullet / fx_p2 的材质。"""
@@ -6686,7 +7143,7 @@ def bullet_beam_materials():
             fp = os.path.join(ROOT, "extensions", m, "libraries", "material_library.xml")
             if os.path.isfile(fp):
                 files.append(fp)
-    except Exception:
+    except OSError:
         pass
     by_id = {}
     for fp in files:
@@ -6788,7 +7245,7 @@ def bullet_beam_build(d):
     if not os.path.isfile(tgt):
         os.makedirs(os.path.dirname(tgt), exist_ok=True)
         # diff 补丁型源组件先合并 base 再写入（直接复制 <diff> 原文游戏无法加载）
-        open(tgt, "w", encoding="utf-8").write(_read_comp_txt(comp))
+        write_text(tgt, _read_comp_txt(comp))
     t2 = open(tgt, encoding="utf-8", errors="ignore").read()
     nt = t2
     if r_:
@@ -6812,14 +7269,9 @@ def bullet_beam_build(d):
                 b = re.sub(r'(<key\s+frame="(?!1")[^"]*"\s+value=")[^"]*(")', r'\g<1>' + u2e + r'\g<2>', b, count=1)
             return b
         nt = re.sub(r'(<uv_animation\s+rotaroundcenter="1"\s+mapchannel="2">.*?</uv_animation>)', rep_u2, nt, count=1)
-    open(tgt, "w", encoding="utf-8", newline="").write(nt)
+    write_text(tgt, nt, newline="")
     created = [os.path.relpath(tgt, tmod)]
-    try:
-        copy_to_moding(mod=tmod, items=created)
-        bullet_cache_refresh_source(tmod)  # 弹丸缓存增量维护（免全盘冷扫）
-        _refresh_soft()                    # 材质/视觉参考等轻量失效
-    except Exception:
-        pass
+    finish_write(tmod, created)
     return {"ok": True, "created": created}
 def _bullet_body_part(t2):
     """弹体 part：第一个有材质、且名称不含附加层词（shockwave/distortion/glow/core）的 part。
@@ -6919,7 +7371,7 @@ def bullet_vis_build(d):
         if comp and os.path.isfile(comp):
             os.makedirs(os.path.dirname(tgt), exist_ok=True)
             # diff 补丁型源组件先合并 base 再写入（直接复制 <diff> 原文游戏无法加载）
-            open(tgt, "w", encoding="utf-8").write(_read_comp_txt(comp))
+            write_text(tgt, _read_comp_txt(comp))
         else:
             c2 = _bullet_comp_for_id(tpl)
             if not c2 or not os.path.isfile(c2):
@@ -6972,14 +7424,9 @@ def bullet_vis_build(d):
                 b = re.sub(r'(<key\s+frame="(?!1")[^"]*"\s+value=")[^"]*(")', r'\g<1>' + uv["u2e"] + r'\g<2>', b, count=1)
             return b
         nt = re.sub(r'(<uv_animation\s+rotaroundcenter="1"\s+mapchannel="2">.*?</uv_animation>)', rep_u2, nt, count=1)
-    open(tgt, "w", encoding="utf-8", newline="").write(nt)
+    write_text(tgt, nt, newline="")
     created = list(dict.fromkeys(extra_created + [os.path.relpath(tgt, tmod)]))
-    try:
-        copy_to_moding(mod=tmod, items=created)
-        bullet_cache_refresh_source(tmod)  # 弹丸缓存增量维护（免全盘冷扫）
-        _refresh_soft()                    # 材质/视觉参考等轻量失效
-    except Exception:
-        pass
+    finish_write(tmod, created)
     return {"ok": True, "created": created}
 
 
@@ -7062,40 +7509,19 @@ def trail_build(d):
         if k in attrs:
             nblk += ' %s="%s"' % (k, attrs[k])
     nblk += '>\n\t\t\t<parameters>\n\t\t\t\t<material name="%s"/>\n\t\t\t</parameters>\n\t\t</effect>' % material
-    created = []
-    if update_mode:
-        t = open(tgt, encoding="utf-8", errors="ignore").read()
-        pat = re.compile(r'<effect\s+name="%s"[^>]*>.*?</effect>' % re.escape(new_type), re.S)
-        n_t = pat.sub(lambda m: nblk, t, count=1)
-        open(tgt, "w", encoding="utf-8", newline="").write(n_t)
-        created.append(os.path.relpath(tgt, mod))
-    elif not os.path.isfile(tgt):
-        open(tgt, "w", encoding="utf-8", newline="").write(
-            DIFF_HEADER + '\t<add sel="//effects">\n\t\t%s\n\t</add>\n</diff>\n' % nblk)
-        created.append(os.path.relpath(tgt, mod))
-    else:
-        t = open(tgt, encoding="utf-8", errors="ignore").read()
-        m = re.search(r'<add\s+sel="//effects">', t)
-        if m:
-            t = t[:m.end()] + "\n\t\t" + nblk + t[m.end():]
-        else:
-            t = t.replace("</diff>", '\t<add sel="//effects">\n\t\t%s\n\t</add>\n</diff>' % nblk, 1)
-        open(tgt, "w", encoding="utf-8", newline="").write(t)
-        created.append(os.path.relpath(tgt, mod))
+    created = [upsert_effect(mod, nblk, "trail_effects.xml", new_type if update_mode else "")]
     comp = _eq_comp_for_id(cls, eid, mod)
     if not comp or not os.path.isfile(comp):
         return {"ok": False, "error": "未找到装备组件文件，无法写入特效引用", "created": created}
     ct = open(comp, encoding="utf-8", errors="ignore").read()
     nct = _set_trail_type(ct, new_type)
     if nct != ct:
-        open(comp, "w", encoding="utf-8").write(nct)
+        write_text(comp, nct)
         try:
             created.append(os.path.relpath(comp, mod))
         except ValueError:
             created.append(comp)
-    copy_to_moding(mod, created)
-    bullet_cache_refresh_source(mod)  # 弹丸缓存增量维护（免全盘冷扫）
-    _refresh_soft()
+    finish_write(mod, created)
     return {"ok": True, "new_type": new_type, "created": created, "src": src}
 def trail_refs():
     """扫描所有导弹组件里的 trailemitter type（去重+计数+中文名），供尾焰轨迹同类参考。"""
@@ -7269,7 +7695,7 @@ def _find_data_dir(comp_dir, eid, comp_path):
             d = os.path.join(comp_dir, m.group(1) + "_data")
             if os.path.isdir(d):
                 return d
-    except Exception:
+    except OSError:
         pass
     return None
 
@@ -7498,7 +7924,7 @@ def delitem(d):
         if os.path.isfile(p):
             try:
                 _collect_tids(open(p, encoding="utf-8", errors="ignore").read())
-            except Exception:
+            except OSError:
                 pass
     if os.path.isfile(wf):
         try:
@@ -7506,7 +7932,7 @@ def delitem(d):
             _wb = re.search(r'<ware\s+id="' + re.escape(iid) + r'"[^>]*>.*?</ware>', _wtxt, re.S)
             if _wb:
                 _collect_tids(_wb.group(0))  # 只收该物品自身 ware 块的 t 引用；禁止全表扫描（会殃及其他 ware 的文本条目）
-        except Exception:
+        except OSError:
             pass
     removed = []
     import shutil
@@ -7529,7 +7955,7 @@ def delitem(d):
         nt = re.sub(r"\n(?:[ \t]+\n)+", "\n", nt)   # 收尾：压掉删条目留下的纯空白孤儿行
         if nt != t:
             try:
-                open(fp, "w", encoding="utf-8", newline="").write(nt)
+                write_text(fp, nt, newline="")
                 removed.append(os.path.relpath(fp, ROOT) + ("（清除条目: " + label + "）" if label else "（清除条目）"))
             except Exception as e:
                 removed.append(os.path.relpath(fp, ROOT) + ("（清条目失败 " + label + ": " + str(e) + "）" if label else "（清条目失败: " + str(e) + "）"))
@@ -7547,10 +7973,14 @@ def delitem(d):
         if _ric2:
             removed.append(_ric2 + "（清舰船图标别名）")
     # mod 自有注册库中该物品的引用条目随物品清理（非外部引用，防残留孤儿）：
-    # shipgroups.xml 的 <select macro="{iid}_macro"/>；jobs.xml 中 id 内嵌该物品宏名的整个 <job> 块。
-    # ships.xml 无逐船引用机制（仅分组/pilot/drop 定义），无需清理。
+    # shipgroups.xml 里该船 macro 的 <select>（顺带清掉因此变空的 add 块）；
+    # ships.xml 里本船 id 的 <ship> 条目；jobs.xml 中 id 内嵌该物品宏名的整个 <job> 块。
     _mesc = re.escape(iid) + r'_macro'
-    strip_entry(os.path.join(mdir, "libraries", "shipgroups.xml"), r'<select\b[^>]*\bmacro="' + _mesc + r'"[^>]*/>', label="shipgroups " + iid + "_macro")
+    _sg_rm = shipgroup_clear(mdir, iid)
+    if any("shipgroups" in x for x in _sg_rm):
+        removed.append("shipgroups %s_macro" % iid)
+    if any(x.endswith("ships.xml") for x in _sg_rm):
+        removed.append("ships " + iid)
     strip_entry(os.path.join(mdir, "libraries", "jobs.xml"), r'<job\b[^>]*\bid="[^"]*' + _mesc + r'[^"]*"[^>]*>.*?</job>', re.S, label="jobs " + iid + "_macro")
     # 清除该物品 t 语言条目（中文 + 英文）
     for tp in _loc_files(mdir):
@@ -7575,7 +8005,7 @@ def delitem(d):
                 changed = True
         if changed:
             t = re.sub(r"\n(?:[ \t]+\n)+", "\n", t)   # 收尾：压掉清文本留下的纯空白孤儿行
-            open(tp, "w", encoding="utf-8", newline="").write(t)
+            write_text(tp, t, newline="")
             removed.append(os.path.relpath(tp, mdir) + "（清文本条目）")
     # 孤儿材质清理（仅舰船）：删除本船 component 引用的、定义于本 mod material_library.xml 中、
     # 且删除后本 mod 内已无其他文件引用的材质定义块；空 collection 一并移除。
@@ -7616,7 +8046,7 @@ def delitem(d):
                                 if ref_re.search(open(fp, encoding="utf-8", errors="ignore").read()):
                                     still_used = True
                                     break
-                            except Exception:
+                            except OSError:
                                 pass
                         if still_used:
                             break
@@ -7641,43 +8071,48 @@ def delitem(d):
     _refresh_soft()
     return {"ok": True, "removed": removed}
 
+# 缓存分组：组名 → (置 None 重建的名称, 清空的 dict 名称)。新增缓存按所在组登记即可，避免逐处手写失效。
+_CACHE_GROUPS = {
+    "lists": (("_LOADOUT_CACHE", "_GLOBAL_ASSETS", "_BULLET_VIS_REFS", "_MATREF_CACHE",
+               "_MACRO_CATALOG", "_TEMPLATES_CACHE", "_SOFTWARE_CACHE"), ()),
+    "content": ((), ("_COMPCACHE", "_GCOMPCACHE")),
+    "scan": (("_EQ_SCAN_CACHE", "_EQ_DUP_CACHE", "_EQ_BY_SOURCE",
+              "_BULLET_SCAN_CACHE", "_BULLET_DUP_CACHE", "_BULLET_BY_SOURCE"), ("_DIR_INDEX",)),
+}
+
+def invalidate_caches(*groups):
+    """按组失效内存缓存：
+    lists   = 舰船/宏/材质/loadout/软件等整体列表（置 None，下次请求重建）
+    content = 组件文件内容缓存（清空）
+    scan    = 全盘资产/装备/弹丸扫描缓存（仅手动刷新使用）"""
+    g = globals()
+    for grp in groups:
+        reset, clear = _CACHE_GROUPS.get(grp, ((), ()))
+        for name in reset:
+            g[name] = None
+        for name in clear:
+            d = g.get(name)
+            if isinstance(d, dict):
+                d.clear()
+    if "lists" in groups:
+        g["_WARES_DIRTY"] = True   # wares owner/成本/材料索引改懒重建（_find_ware 触发）
+        try:
+            LX._loc.clear()        # t 文本表失效，下次 lname/macro_display 重建（含新写入的文本）
+        except Exception:
+            pass
+    return True
+
 def _refresh_soft():
-    """轻量失效（不触发全盘冷扫）：t 文本表 + wares 索引置懒重建 + 各整体缓存（舰船/软件/
-    宏清单/材质参考/loadout/全局资产/组件内容）。不清 equip/bullet 分片缓存——
+    """轻量失效（不触发全盘冷扫）：lists + content 两组。不清 equip/bullet 分片缓存——
     它们的新鲜度由 eq_cache_refresh_source/bullet_cache_refresh_source 按改动来源增量维护，
     避免下一个列表请求触发数十秒全盘冷扫。各整体缓存重建时仍会先比对磁盘签名。"""
-    global _LOADOUT_CACHE, _GLOBAL_ASSETS, _BULLET_VIS_REFS, _MATREF_CACHE, _WARES_DIRTY
-    global _MACRO_CATALOG, _TEMPLATES_CACHE, _SOFTWARE_CACHE
-    _LOADOUT_CACHE = None
-    _GLOBAL_ASSETS = None
-    _BULLET_VIS_REFS = None
-    _MATREF_CACHE = None   # 护盾材质参考
-    _MACRO_CATALOG = None  # 挂载类宏清单（删除舰船后防已删宏残留）
-    _TEMPLATES_CACHE = None  # 舰船清单（新增/删除/改名后重建）
-    _SOFTWARE_CACHE = None   # 软件清单（wares 变更后重建）
-    _COMPCACHE.clear()     # 组件文件内容缓存（防止删除/改文件后读到旧内容）
-    _GCOMPCACHE.clear()
-    _WARES_DIRTY = True    # wares owner/成本/材料索引改懒重建（_find_ware 触发）
-    try:
-        LX._loc.clear()    # t 文本表失效，下次 lname/macro_display 重建（含新写入的文本）
-    except Exception:
-        pass
-    return True
+    return invalidate_caches("lists", "content")
 
 def refresh_caches():
     """全量失效（仅 /api/refresh 手动刷新端点使用）：清空全部内存缓存 + cache/ 下磁盘缓存，
     下次列表请求全盘重扫。工程内新增/删除走各流增量维护（eq_cache_refresh_source /
     bullet_cache_refresh_source + _refresh_soft），无需全盘冷扫。"""
-    global _EQ_SCAN_CACHE, _EQ_DUP_CACHE, _BULLET_SCAN_CACHE, _BULLET_DUP_CACHE
-    global _EQ_BY_SOURCE, _BULLET_BY_SOURCE
-    _refresh_soft()
-    _DIR_INDEX.clear()     # 资产索引全量重建（新增/删除大量文件后由手动刷新兜底；日常增删不清，见 _dir_index）
-    _EQ_SCAN_CACHE = None
-    _EQ_DUP_CACHE = None
-    _EQ_BY_SOURCE = None
-    _BULLET_SCAN_CACHE = None
-    _BULLET_DUP_CACHE = None
-    _BULLET_BY_SOURCE = None
+    invalidate_caches("lists", "content", "scan")
     try:                                   # 磁盘缓存同步失效（下次重启读新扫描）
         if os.path.isdir(_CACHE_DIR):
             for f in os.listdir(_CACHE_DIR):
@@ -7688,8 +8123,285 @@ def refresh_caches():
         old = os.path.join(BASE, "equip_scan.cache.json")   # 旧版单文件缓存（已弃用，顺带清理）
         if os.path.exists(old):
             os.remove(old)
-    except Exception:
+    except OSError:
         pass
+    return True
+
+# ---------- GET 路由处理函数（统一签名 h = Handler 实例） ----------
+def _g_factions(h):
+    # 完整合并派系（原版 + 所有 mod）+ jobs 任务类型；合并失败回退手写常量
+    h._json({"factions": _FACTIONS_ALL or FACTIONS,
+             "categories": [{"id": c, "name": FAC_CAT_NAME[c]} for c in FAC_CAT_ORDER],
+             "tasks": JOB_TASKS})
+
+def _g_costrefs(h):
+    # 建造成本参考值 + 材料下拉列表 + 建造方式(method)枚举
+    h._json({"wares": WARE_MATS, "refs": COST_REFS, "default_mats": DEFAULT_MATS,
+             "prod_methods": PROD_METHODS})
+
+def _g_component(h):
+    # 读某舰船 component 的装备连接点与连接组（供装配预设 path/组挂载下拉）
+    q = h._q()
+    h._json(component_slots((q.get("ship") or [""])[0],
+                            (q.get("source") or [""])[0] or None))
+
+def _g_shipmaterials(h):
+    # 读某船 component 引用的材质及其 material_library 可调参数当前值（材质模块回填）
+    q = h._q()
+    h._json(ship_materials((q.get("ship") or [""])[0],
+                           (q.get("source") or [""])[0] or None))
+
+def _g_shiplod_dout(h):
+    # 读某舰船 ship macro 的默认 loadout（用于回填；无则从 component 填充）
+    q = h._q()
+    h._json(ship_loadout((q.get("ship") or [""])[0],
+                         (q.get("source") or [""])[0] or None))
+
+def _g_shipjobs(h):
+    # 读某舰船所属 mod 现有 jobs.xml，返回该船已有 AI 派系归属（编辑模式回填）
+    q = h._q()
+    h._json(ship_jobs((q.get("ship") or [""])[0],
+                      (q.get("source") or [""])[0] or None))
+
+def _g_shipconnections(h):
+    q = h._q()
+    h._json(ship_connections_detail((q.get("ship") or [""])[0],
+                                    (q.get("source") or [""])[0] or None))
+
+def _g_shipgroups(h):
+    q = h._q()
+    h._json(ship_in_groups((q.get("ship") or [""])[0]))
+
+def _g_shipsoftware(h):
+    q = h._q()
+    ship = (q.get("ship") or [""])[0]
+    src = (q.get("source") or [""])[0] or None
+    tpl = next((t for t in list_templates() if t["id"] == ship
+                and (not src or t["source"] == src)), None)
+    sw = []
+    if tpl:
+        src_base = os.path.join(ROOT, "assets") if tpl["source"] == "vanilla" else os.path.join(ROOT, "extensions", tpl["source"], "assets")
+        mp = _find_ship_macro(os.path.join(src_base, "units", "size_" + tpl["size"]), ship)
+        if mp and os.path.isfile(mp):
+            sw = _ship_software(open(mp, encoding="utf-8", errors="ignore").read())
+    h._json(sw)
+
+def _g_equipkinds(h):
+    q = h._q()
+    h._json(equip_kinds((q.get("cls") or [""])[0]))
+
+def _g_equiptemplates(h):
+    q = h._q()
+    h._json(equip_templates((q.get("cls") or [""])[0], (q.get("kind") or [""])[0]))
+
+def _g_equipread(h):
+    q = h._q()
+    h._json(equip_read((q.get("cls") or [""])[0], (q.get("id") or [""])[0],
+                       (q.get("source") or [""])[0], (q.get("mod") or [""])[0]))
+
+def _g_equiptags(h):
+    q = h._q()
+    h._json(equip_tags((q.get("cls") or [""])[0]))
+
+def _g_equipnumrefs(h):
+    q = h._q()
+    h._json(equip_numeric_refs((q.get("cls") or [""])[0]))
+
+def _g_eqgeom(h):
+    q = h._q()
+    h._json({"geometry": equip_geometry((q.get("ref") or [""])[0])})
+
+def _g_equipchain(h):
+    q = h._q()
+    h._json(equip_chain((q.get("cls") or [""])[0], (q.get("id") or [""])[0]))
+
+def _g_bulleteffectlist(h):
+    q = h._q()
+    h._json(bullet_effect_list((q.get("tag") or [""])[0] or "impact"))
+
+def _g_bulleteffectread(h):
+    q = h._q()
+    h._json(bullet_effect_read((q.get("eid") or [""])[0]))
+
+def _g_bullettrailread(h):
+    q = h._q()
+    h._json(bullet_trail_read((q.get("eid") or [""])[0]))
+
+def _g_bulletbeamread(h):
+    q = h._q()
+    h._json(bullet_beam_read((q.get("eid") or [""])[0]))
+
+def _g_bulletvisread(h):
+    q = h._q()
+    h._json(bullet_vis_read((q.get("eid") or [""])[0]))
+
+def _g_missileusers(h):
+    q = h._q()
+    h._json(missile_users((q.get("id") or [""])[0]))
+
+def _g_explosionusers(h):
+    q = h._q()
+    h._json(explosion_users((q.get("ref") or [""])[0]))
+
+def _g_traileffect(h):
+    qs = h.path.split("?", 1)[1] if "?" in h.path else ""
+    import urllib.parse as _up
+    t = _up.unquote((re.search(r'(?:^|&)type=([^&]+)', qs) or [None, ""])[1])
+    blk, src = _find_trail_effect(t)
+    if not blk:
+        h._json({"ok": False, "error": "未找到特效 %s" % t})
+    else:
+        a = _effect_attrs(blk); a["zh"] = _trail_zh(t); a["source"] = src
+        h._json({"ok": True, "type": t, "attrs": a})
+
+def _g_unpackscan(h):
+    q = h._q()
+    h._json(unpack_scan((q.get("game") or [""])[0],
+                        (q.get("staging") or [""])[0],
+                        (q.get("workshop") or [""])[0]))
+
+def _g_unpackstatus(h):
+    st = {k: v for k, v in _UNPACK.items() if k != "proc"}
+    st["log"] = st["log"][-200:]
+    h._json(st)
+
+def _g_diffvalidate(h):
+    q = h._q()
+    path = (q.get("path") or [""])[0]
+    if not path or not os.path.isfile(path):
+        h._json({"ok": False, "error": "文件不存在: %s" % path}); return
+    diff_txt = open(path, encoding="utf-8", errors="ignore").read()
+    if not _is_diff_txt(diff_txt):
+        h._json({"ok": False, "error": "不是 <diff> 补丁文件"}); return
+    base_path, base_txt = _diff_base_for(path)
+    if not base_txt:
+        h._json({"ok": False, "error": "找不到 base 组件"}); return
+    r = validate_diff(diff_txt, base_txt)
+    r["diff"] = path
+    r["base"] = base_path
+    h._json(r)
+
+def _g_schemas(h):
+    q = h._q()
+    name = (q.get("name") or [""])[0]
+    if name:
+        h._json({"ok": True, "schema": name, "types": _xsd_schema(name)})
+    else:
+        h._json({"ok": True, "schemas": _all_xsd_schemas()})
+
+def _g_difflist(h):
+    # diff 文件列表：扫描所有用户 mod 的 assets 目录，找出 <diff> 补丁文件
+    q = h._q()
+    mod_filter = (q.get("mod") or [""])[0]
+    out = []
+    ex = os.path.join(ROOT, "extensions")
+    mods = [d for d in os.listdir(ex) if os.path.isdir(os.path.join(ex, d))] if os.path.isdir(ex) else []
+    for m in sorted(mods):
+        if m.startswith("ego_dlc_"): continue
+        if mod_filter and m != mod_filter: continue
+        mroot = os.path.join(ex, m, "assets")
+        if not os.path.isdir(mroot): continue
+        for dirpath, _, files in os.walk(mroot):
+            for fn in files:
+                if not fn.endswith(".xml"): continue
+                p = os.path.join(dirpath, fn)
+                try:
+                    txt = open(p, encoding="utf-8", errors="ignore").read(4096)
+                except OSError:
+                    continue
+                if not _is_diff_txt(txt): continue
+                base_path, _ = _diff_base_for(p)
+                out.append({
+                    "id": fn[:-4], "path": p, "source": m,
+                    "rel": os.path.relpath(p, mroot).replace("\\", "/"),
+                    "base": os.path.basename(base_path)[:-4] if base_path else "",
+                })
+    h._json(out)
+
+def _g_diffpreview(h):
+    # diff 合并预览：GET ?path=<diff 文件路径> 返回 base 与 patched 文本
+    q = h._q()
+    path = (q.get("path") or [""])[0]
+    if not path or not os.path.isfile(path):
+        h._json({"ok": False, "error": "文件不存在: %s" % path}); return
+    diff_txt = open(path, encoding="utf-8", errors="ignore").read()
+    if not _is_diff_txt(diff_txt):
+        h._json({"ok": False, "error": "不是 <diff> 补丁文件"}); return
+    base_path, base_txt = _diff_base_for(path)
+    if not base_txt:
+        h._json({"ok": False, "error": "找不到 base 组件"}); return
+    h._json({"ok": True, "diff": path, "base": base_path,
+             "base_txt": base_txt, "patched_txt": _apply_diff_ops(base_txt, diff_txt)})
+
+# 精确匹配优先（如 /api/shipgroups/all 必须先于前缀 /api/shipgroups）
+_GET_EXACT = {
+    "/api/templates": lambda h: h._json(list_templates()),
+    "/api/stats": lambda h: h._json(vanilla_stats()),
+    "/api/enums": lambda h: h._json(vanilla_enums()),
+    "/api/factions": _g_factions,
+    "/api/costrefs": _g_costrefs,
+    "/api/shipgroups/all": lambda h: h._json(shipgroup_all()),
+    "/api/loadoutmacros": lambda h: h._json(loadout_macros()),
+    "/api/softwarelist": lambda h: h._json(_software_list()),
+    "/api/equiprefs": lambda h: h._json(equip_refs()),
+    "/api/moddirs": lambda h: h._json(mod_dirs()),
+    "/api/docklist": lambda h: h._json(dock_list()),
+    "/api/config": lambda h: h._json(load_config()),
+    "/api/unpackstatus": _g_unpackstatus,
+}
+
+# 前缀匹配按顺序取首个命中
+_GET_PREFIX = (
+    ("/api/component", _g_component),
+    ("/api/shipmaterials", _g_shipmaterials),
+    ("/api/shiploadout", _g_shiplod_dout),
+    ("/api/shipjobs", _g_shipjobs),
+    ("/api/shipconnections", _g_shipconnections),
+    ("/api/shipgroups", _g_shipgroups),
+    ("/api/shipsoftware", _g_shipsoftware),
+    ("/api/equipkinds", _g_equipkinds),
+    ("/api/equiptemplates", _g_equiptemplates),
+    ("/api/equipread", _g_equipread),
+    ("/api/shieldmatrefs", lambda h: h._json(_material_refs_all())),
+    ("/api/equiptags", _g_equiptags),
+    ("/api/bulletrefs", lambda h: h._json(bullet_refs())),
+    ("/api/bulleteffectlist", _g_bulleteffectlist),
+    ("/api/bulleteffectread", _g_bulleteffectread),
+    ("/api/bullettraillist", lambda h: h._json(bullet_trail_materials())),
+    ("/api/bullettrailread", _g_bullettrailread),
+    ("/api/bulletbeamlist", lambda h: h._json(bullet_beam_materials())),
+    ("/api/bulletbeamread", _g_bulletbeamread),
+    ("/api/bulletvisread", _g_bulletvisread),
+    ("/api/bulletvislist", lambda h: h._json(bullet_vis_materials())),
+    ("/api/bulletvisrefs", lambda h: h._json(bullet_vis_refs())),
+    ("/api/equipnumrefs", _g_equipnumrefs),
+    ("/api/missileusers", _g_missileusers),
+    ("/api/explosionusers", _g_explosionusers),
+    ("/api/missiletags", lambda h: h._json(missile_tags_ref())),
+    ("/api/trailrefs", lambda h: h._json(trail_refs())),
+    ("/api/explosionrefs", lambda h: h._json(explosion_refs())),
+    ("/api/explosioneffects", lambda h: h._json(explosion_effects())),
+    ("/api/trailmaterials", lambda h: h._json(trail_materials())),
+    ("/api/traileffect", _g_traileffect),
+    ("/api/eqgeom", _g_eqgeom),
+    ("/api/equipchain", _g_equipchain),
+    ("/api/unpackscan", _g_unpackscan),
+    ("/api/diffvalidate", _g_diffvalidate),
+    ("/api/schemas", _g_schemas),
+    ("/api/difflist", _g_difflist),
+    ("/api/diffpreview", _g_diffpreview),
+)
+
+def _dispatch_get(h):
+    fn = _GET_EXACT.get(h.path)
+    if fn is None:
+        for pfx, f in _GET_PREFIX:
+            if h.path.startswith(pfx):
+                fn = f
+                break
+    if fn is None:
+        return False
+    fn(h)
     return True
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -7701,385 +8413,93 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_header("Pragma", "no-cache")
         self.end_headers()
         self.wfile.write(body.encode("utf-8"))
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
+    def _q(self):
+        from urllib.parse import urlparse, parse_qs
+        return parse_qs(urlparse(self.path).query)
+    def _body(self):
+        ln = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(ln).decode("utf-8"))
     def do_GET(self):
-        if self.path == "/api/templates":
-            # 内存 + 磁盘双层缓存（输入签名校验）：未变时免扫描，新增/修改后签名不一致自动重建
-            self._send(200, json.dumps(list_templates(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/stats":
-            # 原版 L/XL 属性参考范围
-            self._send(200, json.dumps(vanilla_stats(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/enums":
-            # 枚举型属性的标准取值（icon/type/makerrace）
-            self._send(200, json.dumps(vanilla_enums(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/factions":
-            # 完整合并派系（原版 + 所有 mod）+ jobs 任务类型；合并失败回退手写常量
-            self._send(200, json.dumps({"factions": _FACTIONS_ALL or FACTIONS,
-                              "categories": [{"id": c, "name": FAC_CAT_NAME[c]} for c in FAC_CAT_ORDER],
-                              "tasks": JOB_TASKS},
-                                       ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/costrefs":
-            # 建造成本参考值 + 材料下拉列表 + 建造方式(method)枚举
-            self._send(200, json.dumps({"wares": WARE_MATS, "refs": COST_REFS, "default_mats": DEFAULT_MATS,
-                                         "prod_methods": PROD_METHODS},
-                                       ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/component"):
-            # 读某舰船 component 的装备连接点与连接组（供装配预设 path/组挂载下拉）
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            ship = (q.get("ship") or [""])[0]
-            src = (q.get("source") or [""])[0] or None
-            self._send(200, json.dumps(component_slots(ship, src), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/shipmaterials"):
-            # 读某船 component 引用的材质及其 material_library 可调参数当前值（材质模块回填）
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            ship = (q.get("ship") or [""])[0]
-            src = (q.get("source") or [""])[0] or None
-            self._send(200, json.dumps(ship_materials(ship, src), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/shiploadout"):
-            # 读某舰船 ship macro 的默认 loadout（用于回填；无则从 component 填充）
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            ship = (q.get("ship") or [""])[0]
-            src = (q.get("source") or [""])[0] or None
-            self._send(200, json.dumps(ship_loadout(ship, src), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/shipjobs"):
-            # 读某舰船所属 mod 现有 jobs.xml，返回该船已有 AI 派系归属（编辑模式回填）
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            ship = (q.get("ship") or [""])[0]
-            src = (q.get("source") or [""])[0] or None
-            self._send(200, json.dumps(ship_jobs(ship, src), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/shipgroups/all":
-            self._send(200, json.dumps(shipgroup_all(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/shipconnections"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            ship = (q.get("ship") or [""])[0]
-            src = (q.get("source") or [""])[0]
-            self._send(200, json.dumps(ship_connections_detail(ship, src or None), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/shipgroups"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            ship = (q.get("ship") or [""])[0]
-            self._send(200, json.dumps(ship_in_groups(ship), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/loadoutmacros":
-            # 装配预设可选装备宏（engine/shield/weapon/turret/thruster）
-            self._send(200, json.dumps(loadout_macros(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/softwarelist":
-            self._send(200, json.dumps(_software_list(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/shipsoftware"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            ship = (q.get("ship") or [""])[0]
-            src = (q.get("source") or [""])[0] or None
-            tpl = next((t for t in list_templates() if t["id"] == ship
-                        and (not src or t["source"] == src)), None)
-            sw = []
-            if tpl:
-                src_base = os.path.join(ROOT, "assets") if tpl["source"] == "vanilla" else os.path.join(ROOT, "extensions", tpl["source"], "assets")
-                mp = _find_ship_macro(os.path.join(src_base, "units", "size_" + tpl["size"]), ship)
-                if mp and os.path.isfile(mp):
-                    sw = _ship_software(open(mp, encoding="utf-8", errors="ignore").read())
-            self._send(200, json.dumps(sw, ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/equipkinds"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            cls = (q.get("cls") or [""])[0]
-            self._send(200, json.dumps(equip_kinds(cls), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/equiptemplates"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            cls = (q.get("cls") or [""])[0]; kind = (q.get("kind") or [""])[0]
-            self._send(200, json.dumps(equip_templates(cls, kind), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/equipread"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            cls = (q.get("cls") or [""])[0]; eid = (q.get("id") or [""])[0]; src = (q.get("source") or [""])[0]
-            self._send(200, json.dumps(equip_read(cls, eid, src, (q.get("mod") or [""])[0]), ensure_ascii=False), "application/json; charset=utf-8")
+        if _dispatch_get(self):
             return
-        elif self.path.startswith("/api/shieldmatrefs"):
-            self._send(200, json.dumps(_material_refs_all(), ensure_ascii=False), "application/json; charset=utf-8")
-            return
-        elif self.path.startswith("/api/equiptags"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            cls = (q.get("cls") or [""])[0]
-            self._send(200, json.dumps(equip_tags(cls), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/bulletrefs"):
-            self._send(200, json.dumps(bullet_refs(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/bulleteffectlist"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            self._send(200, json.dumps(bullet_effect_list((q.get("tag") or [""])[0] or "impact"), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/bulleteffectread"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            self._send(200, json.dumps(bullet_effect_read((q.get("eid") or [""])[0]), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/bullettraillist"):
-            self._send(200, json.dumps(bullet_trail_materials(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/bullettrailread"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            self._send(200, json.dumps(bullet_trail_read((q.get("eid") or [""])[0]), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/bulletbeamlist"):
-            self._send(200, json.dumps(bullet_beam_materials(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/bulletbeamread"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            self._send(200, json.dumps(bullet_beam_read((q.get("eid") or [""])[0]), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/bulletvisread"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            self._send(200, json.dumps(bullet_vis_read((q.get("eid") or [""])[0]), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/bulletvislist"):
-            self._send(200, json.dumps(bullet_vis_materials(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/bulletvisrefs"):
-            self._send(200, json.dumps(bullet_vis_refs(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/equipnumrefs"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            cls = (q.get("cls") or [""])[0]
-            self._send(200, json.dumps(equip_numeric_refs(cls), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/missileusers"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            mid = (q.get("id") or [""])[0]
-            self._send(200, json.dumps(missile_users(mid), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/explosionusers"):
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            ref = (q.get("ref") or [""])[0]
-            self._send(200, json.dumps(explosion_users(ref), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/missiletags"):
-            self._send(200, json.dumps(missile_tags_ref(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/trailrefs"):
-            self._send(200, json.dumps(trail_refs(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/explosionrefs"):
-            self._send(200, json.dumps(explosion_refs(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/explosioneffects"):
-            self._send(200, json.dumps(explosion_effects(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/trailmaterials"):
-            self._send(200, json.dumps(trail_materials(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/traileffect"):
-            _q = self.path.split("?", 1)[1] if "?" in self.path else ""
-            _t = (re.search(r'(?:^|&)type=([^&]+)', _q) or [None, ""])[1]
-            import urllib.parse as _up
-            _t = _up.unquote(_t)
-            blk, src = _find_trail_effect(_t)
-            if not blk:
-                self._send(200, json.dumps({"ok": False, "error": "未找到特效 %s" % _t}, ensure_ascii=False), "application/json; charset=utf-8")
-            else:
-                a = _effect_attrs(blk); a["zh"] = _trail_zh(_t); a["source"] = src
-                self._send(200, json.dumps({"ok": True, "type": _t, "attrs": a}, ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/equiprefs":
-            # 装备参考值（价格/材料按 class+尺寸）
-            self._send(200, json.dumps(equip_refs(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/eqgeom"):
-            # 按 component ref 物品 id 查该物品的几何模型路径（供前端几何栏联动）
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            ref = (q.get("ref") or [""])[0]
-            self._send(200, json.dumps({"geometry": equip_geometry(ref)}, ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/equipchain"):
-            # 装备引用链自动发现（macro→component→data→bullet），只读
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            cls = (q.get("cls") or [""])[0]; eid = (q.get("id") or [""])[0]
-            self._send(200, json.dumps(equip_chain(cls, eid), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/moddirs":
-            # X4 extensions 下的 mod 目录（路径选择）
-            self._send(200, json.dumps(mod_dirs(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/docklist":
-            # dock 复用模板列表（原版/DLC/mod 的 dock 类组件）
-            self._send(200, json.dumps(dock_list(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path == "/api/config":
-            # 记住的目标 mod 路径
-            self._send(200, json.dumps(load_config(), ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/unpackscan"):
-            # 游戏解包：基游戏 cat + 游戏 extensions（含松散 mod / 工坊 ws_*）+ Vortex 暂存区
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            self._send(200, json.dumps(unpack_scan((q.get("game") or [""])[0],
-                                                   (q.get("staging") or [""])[0],
-                                                   (q.get("workshop") or [""])[0]), ensure_ascii=False),
-                       "application/json; charset=utf-8")
-        elif self.path == "/api/unpackstatus":
-            # 解包任务状态（log 截尾，proc 不外发）
-            st = {k: v for k, v in _UNPACK.items() if k != "proc"}
-            st["log"] = st["log"][-200:]
-            self._send(200, json.dumps(st, ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/diffvalidate"):
-            # diff 离线校验：GET ?path=<diff 文件路径> 自动找 base 并校验
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            path = (q.get("path") or [""])[0]
-            if not path or not os.path.isfile(path):
-                self._send(200, json.dumps({"ok": False, "error": "文件不存在: %s" % path},
-                                           ensure_ascii=False), "application/json; charset=utf-8")
-            else:
-                diff_txt = open(path, encoding="utf-8", errors="ignore").read()
-                if not _is_diff_txt(diff_txt):
-                    self._send(200, json.dumps({"ok": False, "error": "不是 <diff> 补丁文件"},
-                                               ensure_ascii=False), "application/json; charset=utf-8")
-                else:
-                    base_path, base_txt = _diff_base_for(path)
-                    if not base_txt:
-                        self._send(200, json.dumps({"ok": False, "error": "找不到 base 组件"},
-                                                   ensure_ascii=False), "application/json; charset=utf-8")
-                    else:
-                        r = validate_diff(diff_txt, base_txt)
-                        r["diff"] = path
-                        r["base"] = base_path
-                        self._send(200, json.dumps(r, ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/schemas"):
-            # XSD 动态解析：GET ?name=<xsd 名（不含扩展名）> 返回该 schema 的枚举定义；
-            # 无 name 参数时返回全部可用 schema 的枚举汇总
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            name = (q.get("name") or [""])[0]
-            if name:
-                r = _xsd_schema(name)
-                self._send(200, json.dumps({"ok": True, "schema": name, "types": r},
-                                           ensure_ascii=False), "application/json; charset=utf-8")
-            else:
-                r = _all_xsd_schemas()
-                self._send(200, json.dumps({"ok": True, "schemas": r},
-                                           ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/difflist"):
-            # diff 文件列表：扫描所有用户 mod 的 assets 目录，找出 <diff> 补丁文件
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            mod_filter = (q.get("mod") or [""])[0]
-            out = []
-            ex = os.path.join(ROOT, "extensions")
-            mods = [d for d in os.listdir(ex) if os.path.isdir(os.path.join(ex, d))] if os.path.isdir(ex) else []
-            for m in sorted(mods):
-                if m.startswith("ego_dlc_"): continue
-                if mod_filter and m != mod_filter: continue
-                mroot = os.path.join(ex, m, "assets")
-                if not os.path.isdir(mroot): continue
-                for dirpath, _, files in os.walk(mroot):
-                    for fn in files:
-                        if not fn.endswith(".xml"): continue
-                        p = os.path.join(dirpath, fn)
-                        try:
-                            txt = open(p, encoding="utf-8", errors="ignore").read(4096)
-                        except Exception:
-                            continue
-                        if not _is_diff_txt(txt): continue
-                        base_path, _ = _diff_base_for(p)
-                        rel = os.path.relpath(p, mroot).replace("\\", "/")
-                        out.append({
-                            "id": fn[:-4], "path": p, "source": m, "rel": rel,
-                            "base": os.path.basename(base_path)[:-4] if base_path else "",
-                        })
-            self._send(200, json.dumps(out, ensure_ascii=False), "application/json; charset=utf-8")
-        elif self.path.startswith("/api/diffpreview"):
-            # diff 合并预览：GET ?path=<diff 文件路径> 返回 base 与 patched 文本
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            path = (q.get("path") or [""])[0]
-            if not path or not os.path.isfile(path):
-                self._send(200, json.dumps({"ok": False, "error": "文件不存在: %s" % path},
-                                           ensure_ascii=False), "application/json; charset=utf-8")
-            else:
-                diff_txt = open(path, encoding="utf-8", errors="ignore").read()
-                if not _is_diff_txt(diff_txt):
-                    self._send(200, json.dumps({"ok": False, "error": "不是 <diff> 补丁文件"},
-                                               ensure_ascii=False), "application/json; charset=utf-8")
-                else:
-                    base_path, base_txt = _diff_base_for(path)
-                    if not base_txt:
-                        self._send(200, json.dumps({"ok": False, "error": "找不到 base 组件"},
-                                                   ensure_ascii=False), "application/json; charset=utf-8")
-                    else:
-                        patched = _apply_diff_ops(base_txt, diff_txt)
-                        self._send(200, json.dumps({
-                            "ok": True, "diff": path, "base": base_path,
-                            "base_txt": base_txt, "patched_txt": patched
-                        }, ensure_ascii=False), "application/json; charset=utf-8")
-        else:
-            try:
-                html = open(INDEX_HTML, encoding="utf-8").read()
-            except Exception:
-                html = "<h1>index.html 缺失</h1>"
-            self._send(200, html)
+        try:
+            html = open(INDEX_HTML, encoding="utf-8").read()
+        except Exception:
+            html = "<h1>index.html 缺失</h1>"
+        self._send(200, html)
     def do_POST(self):
         if self.path not in ("/api/generate", "/api/edit", "/api/config", "/api/pickdir", "/api/dirtree",
                              "/api/equipgenerate", "/api/equipedit",
                              "/api/bulletgenerate", "/api/bulletedit", "/api/refresh",
                              "/api/shipmodelsync", "/api/componentassemble", "/api/dockclone",
-                             "/api/shipgroup/save", "/api/explosionbuild", "/api/trailnew",
+                             "/api/explosionbuild", "/api/trailnew",
                              "/api/bulleteffectbuild", "/api/bullettrailbuild", "/api/bulletbeambuild", "/api/bulletvisbuild",
                              "/api/delitem", "/api/diffvalidate",
                              "/api/unpack", "/api/unpackcancel"):
             self._send(404, "not found"); return
-        ln = int(self.headers.get("Content-Length", 0))
         try:
             if self.path == "/api/generate":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = generate(d)
             elif self.path == "/api/edit":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = edit(d)
             elif self.path == "/api/equipgenerate":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = equip_generate(d)
             elif self.path == "/api/equipedit":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = equip_edit(d)
             elif self.path == "/api/bulletgenerate":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = bullet_generate(d)
             elif self.path == "/api/bulletedit":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = bullet_edit(d)
             elif self.path == "/api/shipmodelsync":
                 # EGO Blender 导出目录 → 目标 mod：py 处理 + macro 连接点归位 + 模型/ani/dae 覆盖 + moding 结构
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = ship_model_sync(d)
             elif self.path == "/api/componentassemble":
                 # 组件（炮塔等）装配：ego xml 模板 + 补丁 + data 复制 + macro 改名 + index 注册
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = component_assemble(d)
             elif self.path == "/api/dockclone":
                 # 原版 dock 复用：组件/宏改名 + 可选替换 Blender 导出 waypoint + index 注册 + moding 结构
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = dock_clone(d)
-            elif self.path == "/api/shipgroup/save":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
-                r = shipgroup_save(d)
             elif self.path == "/api/explosionbuild":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = explosion_build(d)
             elif self.path == "/api/trailnew":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = trail_build(d)
             elif self.path == "/api/bulleteffectbuild":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = bullet_effect_build(d)
             elif self.path == "/api/bullettrailbuild":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = bullet_trail_build(d)
             elif self.path == "/api/bulletbeambuild":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = bullet_beam_build(d)
             elif self.path == "/api/bulletvisbuild":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = bullet_vis_build(d)
             elif self.path == "/api/delitem":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = delitem(d)
             elif self.path == "/api/unpack":
                 # 游戏解包：后台线程顺序跑 XRCatTool
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = unpack_run(d)
             elif self.path == "/api/unpackcancel":
                 r = unpack_cancel()
             elif self.path == "/api/diffvalidate":
                 # diff 离线校验：POST {"diff": "...", "base": "..."} 直接校验文本
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 diff_txt = d.get("diff", "")
                 base_txt = d.get("base", "")
                 if not diff_txt:
@@ -8093,15 +8513,15 @@ class H(http.server.BaseHTTPRequestHandler):
                 refresh_caches()
                 r = {"ok": True}
             elif self.path == "/api/config":
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 c = load_config(); c.update(d)
                 save_config(c)
                 r = {"ok": True, "config": c}
             elif self.path == "/api/dirtree":  # 目录树浏览（浏览器内交互，不依赖系统对话框）
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 r = dirtree(d.get("path") or "", bool(d.get("files")))
             else:  # /api/pickdir：弹出原生文件夹选择对话框
-                d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                d = self._body()
                 p = pick_dir_dialog()
                 if p:
                     c = load_config(); c["target_mod"] = p; save_config(c)
@@ -8111,7 +8531,7 @@ class H(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             import traceback; traceback.print_exc()
             r = {"ok": False, "error": "服务器错误: %s" % e}
-        self._send(200, json.dumps(r, ensure_ascii=False), "application/json; charset=utf-8")
+        self._json(r)
     def log_message(self, *a): pass
 
 # ── 游戏解包（调用官方 XRCatTool，后台线程 + 状态轮询） ──
@@ -8152,7 +8572,7 @@ def _mod_root(d):
             c = os.path.join(d, f)
             if os.path.isdir(c) and _looks_mod(c):
                 return c
-    except Exception:
+    except OSError:
         pass
     return ""
 
@@ -8175,7 +8595,7 @@ def _mod_info(name, root, origin):
             if fl.endswith(".cat") and "_sig" not in fl:
                 cats.append({"name": f, "path": os.path.join(root, f),
                              "size": os.path.getsize(os.path.join(root, f))})
-    except Exception:
+    except OSError:
         pass
     if cats:
         return {"name": name, "root": root, "origin": origin, "kind": "packed",
@@ -8189,9 +8609,9 @@ def _mod_info(name, root, origin):
                 n += 1
                 try:
                     total += os.path.getsize(os.path.join(r, f))
-                except Exception:
+                except OSError:
                     pass
-    except Exception:
+    except OSError:
         pass
     return {"name": name, "root": root, "origin": origin, "kind": "loose",
             "cats": [], "has_subst": False, "files": n, "size": total}
@@ -8344,8 +8764,8 @@ def unpack_run(d):
                     os.makedirs(os.path.dirname(d), exist_ok=True)
                     shutil.copy2(s, d)
                     n += 1
-                except Exception:
-                    pass
+                except OSError as e:
+                    _UNPACK.setdefault("log", []).append("复制失败 %s：%s" % (d, e))
         return n
 
     def work():
@@ -8403,7 +8823,7 @@ def unpack_cancel():
     if p:
         try:
             p.kill()
-        except Exception:
+        except OSError:
             pass
     return {"ok": True}
 
@@ -8440,8 +8860,8 @@ def main():
                 for _b in _global_assets_roots():
                     _dir_index(_b)      # 组件定位索引：预热后 /api/loadoutmacros、装配预设等毫秒级
                 equip_scan()
-            except Exception:
-                pass
+            except Exception as e:
+                print("[warn] 后台预热失败：%s" % e)
         threading.Thread(target=_warm, daemon=True).start()
         # 直接运行时自动打开浏览器：后台轮询，等端口真正开始监听再开，避免"拒绝连接"
         def _open_browser():
@@ -8450,7 +8870,7 @@ def main():
                 try:
                     with _sk.create_connection(("127.0.0.1", 8765), timeout=0.3):
                         break
-                except Exception:
+                except OSError:
                     time.sleep(0.2)
             try:
                 webbrowser.open("http://127.0.0.1:8765")
