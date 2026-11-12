@@ -144,9 +144,9 @@ EVE_Ship_Builder/
 
 ## 六、后端接口速查（server.py 路由）
 
-路由定义集中在 `_GET_EXACT` / `_GET_PREFIX`（server.py ~L8337）与 `do_POST` 白名单（~L8433）。当前 **GET 51 条**（13 精确 + 38 前缀）、**POST 23 条**。
+路由定义集中在 `_GET_EXACT` / `_GET_PREFIX`（server.py ~L8337）与 `do_POST` 白名单（~L8433）。当前 **GET 52 条**（14 精确 + 38 前缀）、**POST 23 条**。
 
-**舰船（GET）**：`templates` · `stats` · `enums` · `factions` · `costrefs` · `component?ship=` · `shiploadout` · `shipjobs` · `shipconnections` · `shipgroups?ship=` · `shipgroups/all` · `shipmaterials` · `shipsoftware` · `softwarelist` · `loadoutmacros`
+**舰船（GET）**：`templates` · `stats` · `enums` · `factions` · `costrefs` · `component?ship=` · `shiploadout` · `shipjobs` · `shipconnections` · `shipgroups?ship=` · `shipgroups/all` · `shipmaterials` · `shipsoftware` · `softwarelist` · `loadoutmacros` · `shiplint?ship=`（结构体检）
 **舰船（POST）**：`generate` · `edit` · `delitem`
 
 **装备（GET）**：`equipkinds` · `equiptemplates` · `equipread` · `equiptags` · `equiprefs` · `equipnumrefs` · `equipchain` · `eqgeom` · `shieldmatrefs`

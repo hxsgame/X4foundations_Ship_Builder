@@ -2140,6 +2140,14 @@ def generate(d):
     if _err:
         _rollback_created(mod, created)
         return {"ok": False, "error": "component XML 非法，拒绝写入（%s）：%s" % (os.path.basename(dst_comp), _err)}
+    # R6 结构校验（写盘前）：兼容标签数 ≥ 升级组数会让原版建造界面点炮塔崩溃
+    _lint = lint_ship_texts(new_id, size, ctxt)
+    if _lint["errors"] and not d.get("force"):
+        _rollback_created(mod, created)
+        return {"ok": False,
+                "error": "舰船结构校验未通过：%s（修正挂载 tags 或增加升级组后重试；确认风险可传 force=1 强制生成）"
+                         % _lint["errors"][0]["msg"],
+                "lint": _lint}
     os.makedirs(os.path.dirname(dst_comp), exist_ok=True)
     write_text(dst_comp, ctxt)
     created.append(os.path.relpath(dst_comp, mod))
@@ -2258,6 +2266,11 @@ def generate(d):
     os.makedirs(os.path.dirname(dst_mac), exist_ok=True)
     if d.get("software"):
         mtxt = _apply_ship_software(mtxt, d["software"])
+    # R6 结构校验（macro 层）：悬空 ref / 内挂宏入口非法，写盘前拦截
+    _lint = lint_ship_texts(new_id, size, ctxt, mtxt)
+    if _lint["errors"] and not d.get("force"):
+        _rollback_created(mod, created)
+        return {"ok": False, "error": "舰船结构校验未通过：%s" % _lint["errors"][0]["msg"], "lint": _lint}
     _err = _xml_check(mtxt)
     if _err:
         _rollback_created(mod, created)
@@ -2327,7 +2340,9 @@ def generate(d):
     _refresh_soft()  # 舰船流不写装备/弹丸文件：轻量失效 t文本/wares索引/loadout/全局资产（免全量冷扫）
     return {"ok": True, "created": created, "modified": modified,
             "moding": moding, "moding_base": os.path.join(mod, "moding"),
-            "warnings": verify_model_refs(mod, dst_comp) + jobs_skip_warn(d.get("jobs")) + mtune_warns + _geo_warns + _da_warns,
+            "warnings": verify_model_refs(mod, dst_comp) + jobs_skip_warn(d.get("jobs")) + mtune_warns + _geo_warns + _da_warns
+                        + [w["msg"] for w in _lint["warnings"]],
+            "lint": _lint,
             "tids": tids, "new_da": new_da if (tpl["dockarea"] and da_ok) else None}
 
 def verify_model_refs(mod, comp_path):
@@ -3121,9 +3136,14 @@ def edit(d):
         modified.append(_sal)
     moding = copy_to_moding(mod, modified)
     _refresh_soft()  # 舰船流不写装备/弹丸文件：轻量失效 t文本/wares索引/loadout/全局资产（免全量冷扫）
+    # R6 结构体检：修改模式只告警不拦截（老船结构可能本就不规范，避免卡住编辑）
+    _lint = ship_lint(mod, cid)
     return {"ok": True, "id": cid, "modified": modified, "moding": moding,
             "moding_base": os.path.join(mod, "moding"), "bakdir": bakdir,
-            "warnings": jobs_skip_warn(d.get("jobs")) + mtune_warns}
+            "warnings": jobs_skip_warn(d.get("jobs")) + mtune_warns
+                        + [w["msg"] for w in _lint.get("warnings") or []]
+                        + [e["msg"] for e in _lint.get("errors") or []],
+            "lint": _lint}
 
 def allocate_tids(d):
     """分配下一组 t id（name/basename/description）。
@@ -4004,6 +4024,159 @@ def ship_component_connections(ship_id, source=None):
                         "group": gm.group(1) if gm else ""})
         return out
     return []
+
+# ---------- 舰船结构校验（R6 lint，只读） ----------
+# 原版 ui/addons/ego_detailmonitor/menu_ship_configuration.lua 的 setupGroupData()
+# 按"升级组数 n"分配 EquipmentCompatibilityInfo 缓冲，却按"连接兼容标签数 n_comp"写入；
+# n_comp > n 时堆越界，表现为建造界面点炮塔直接崩游戏（dump 落在 lua51_64.dll 随机地址）。
+# 规则：任一连接的兼容标签数必须严格小于该船升级组数。详见 docs/RULES.md R6。
+COMPAT_TAGS = ("standard", "missile", "mining", "highpower",
+               "venture", "boron", "xenon", "advanced")
+
+def _lint_item(code, level, msg, **kw):
+    d = {"code": code, "level": level, "msg": msg}
+    d.update(kw)
+    return d
+
+def _conns_from_comp_text(txt):
+    """component XML → [{name,tags,group}]（与 ship_component_connections 同口径，纯文本版）。"""
+    out = []
+    for m in re.finditer(r"<connection\b([^>]*?)/?>", txt or ""):
+        attrs = m.group(1)
+        nm = re.search(r'\bname="([^"]+)"', attrs)
+        if not nm:
+            continue
+        tm = re.search(r'tags="([^"]*)"', attrs)
+        gm = re.search(r'group="([^"]*)"', attrs)
+        out.append({"name": nm.group(1), "tags": (tm.group(1) if tm else "").strip(),
+                    "group": gm.group(1) if gm else ""})
+    return out
+
+def lint_ship_texts(ship_id, size, comp_txt, mac_txt=None):
+    """对 component/macro 文本做结构体检（不读盘、不改盘）。
+    返回 {ship,size,ok,errors,warnings,stats}；errors 非空 = 存在会让游戏崩溃/失效的问题。
+    mac_txt 传 None 表示跳过 macro 层检查（生成流程中宏文本尚未就绪时用）。"""
+    conns = _conns_from_comp_text(comp_txt)
+    names = {c["name"] for c in conns}
+    groups = {}
+    for c in conns:
+        if c["group"]:
+            groups.setdefault(c["group"], []).append(c)
+    n = len(groups)
+    errors, warnings = [], []
+
+    # 1) 兼容标签越界（致命）：每个连接单独计算，取最大值
+    max_compat = 0
+    for c in conns:
+        hit = sorted(set(c["tags"].split()) & set(COMPAT_TAGS))
+        max_compat = max(max_compat, len(hit))
+        if n and len(hit) >= n:
+            errors.append(_lint_item(
+                "E_COMPAT_OVERFLOW", "error",
+                "连接 %s 带 %d 个兼容标签（%s）≥ 全船升级组 %d 个：建造界面点该槽位会让原版 UI 缓冲越界崩溃"
+                % (c["name"], len(hit), "/".join(hit), n),
+                conn=c["name"], group=c["group"], compat=hit, groups=n,
+                hint="删到 ≤%d 个兼容标签，或增加升级组（按原版给每组配护盾/引擎）" % max(n - 1, 0)))
+
+    # 2) 组结构警告（对应 debuglog 的 @Artists 提示，不致命）
+    for gname, lst in groups.items():
+        tag_sets = [set(x["tags"].split()) for x in lst]
+        has_turret = any("turret" in t for t in tag_sets)
+        has_shield = any("shield" in t for t in tag_sets)
+        has_engine = any("engine" in t for t in tag_sets)
+        if has_turret and not has_shield and not has_engine:
+            warnings.append(_lint_item("W_GROUP_ONLY_TURRET", "warning",
+                "组 %s 内只有炮塔、没有护盾/引擎（原版报 has only turrets in group）" % gname, group=gname))
+        if gname.lower().startswith("eng") and not has_shield:
+            warnings.append(_lint_item("W_ENGINE_NO_SHIELD", "warning",
+                "引擎组 %s 内没有护盾（原版报 has no shields in engine group）" % gname, group=gname))
+
+    # 3) geometry 尺寸目录与组件尺寸不一致（x150 类事故的预警）
+    if size:
+        for m in re.finditer(r'<source\b[^>]*geometry="([^"]+)"', comp_txt or ""):
+            geo = m.group(1).replace("\\", "/")
+            sm = re.search(r"/size_(s|m|l|xl)/", geo)
+            if sm and sm.group(1) != size:
+                warnings.append(_lint_item("W_GEO_SIZE_MISMATCH", "warning",
+                    "geometry 指向 size_%s 目录，但组件尺寸是 size_%s：%s" % (sm.group(1), size, geo),
+                    geometry=geo))
+
+    # 4) macro 层：悬空引用 / 内挂宏入口非法 / loadout 槽位不存在
+    if mac_txt is not None:
+        mb = re.search(r'<connections\b[^>]*>(.*?)</connections>', mac_txt or "", re.S)
+        if mb:
+            for cm in re.finditer(r'<connection\b([^>]*)>(.*?)</connection>|<connection\b([^>]*)/>', mb.group(1), re.S):
+                attrs = cm.group(3) if cm.group(3) is not None else cm.group(1)
+                rf = re.search(r'ref="([^"]+)"', attrs)
+                if not rf:
+                    continue
+                ref = rf.group(1)
+                if names and ref not in names:
+                    errors.append(_lint_item("E_DANGLING_REF", "error",
+                        "macro connection ref=\"%s\" 在 component 中不存在（游戏会静默忽略该挂载）" % ref,
+                        conn=ref))
+                    continue
+                if cm.group(3) is not None:
+                    continue
+                mm = re.search(r'<macro\s+ref="([^"]+)"(?:\s+connection="([^"]*)")?', cm.group(2))
+                if not mm:
+                    continue
+                mname, mconn = mm.group(1), (mm.group(2) or "")
+                valid, suggest = _macro_entry_info(mname)
+                if valid and mconn and mconn not in valid:
+                    errors.append(_lint_item("E_BAD_MACRO_ENTRY", "error",
+                        "连接 %s 挂载 %s 用了入口 %s，该宏不存在此入口（建议 %s）"
+                        % (ref, mname, mconn, suggest or valid[0]),
+                        conn=ref, macro=mname, connection=mconn, suggest=suggest or (valid[0] if valid else "")))
+        lb = re.search(r'<loadout\b[^>]*>(.*?)</loadout>', mac_txt or "", re.S)
+        if lb:
+            for pm in re.finditer(r'\bpath="([^"]+)"', lb.group(1)):
+                p = pm.group(1).strip()
+                if p.startswith("../"):
+                    p = p[3:]
+                if p and p not in ("..", ".") and names and p not in names:
+                    warnings.append(_lint_item("W_LOADOUT_PATH", "warning",
+                        "装配预设引用了不存在的槽位 %s（该槽位不参与装配）" % p, path=p))
+
+    return {"ship": ship_id, "size": size, "ok": not errors,
+            "errors": errors, "warnings": warnings,
+            "stats": {"conns": len(conns), "groups": n, "max_compat": max_compat}}
+
+def _locate_ship(ship_id, source=None):
+    """按 id 定位已部署的舰船 component/macro。返回 {size,source,comp,macro,tpl} 或 None。"""
+    tpl = next((t for t in list_templates()
+                if t["id"] == ship_id and (not source or t["source"] == source)), None)
+    if not tpl:
+        return None
+    src_base = (os.path.join(ROOT, "assets") if tpl["source"] == "vanilla"
+                else os.path.join(ROOT, "extensions", tpl["source"], "assets"))
+    un = os.path.join(src_base, "units", "size_" + tpl["size"])
+    comp = os.path.join(un, ship_id + ".xml")
+    if not os.path.isfile(comp):
+        return None
+    mac = _find_ship_macro(un, ship_id) or _find_ship_macro_global(tpl["size"], ship_id)
+    return {"size": tpl["size"], "source": tpl["source"], "comp": comp,
+            "macro": mac if (mac and os.path.isfile(mac)) else "", "tpl": tpl}
+
+def ship_lint(mod, ship_id, source=None):
+    """GET /api/shiplint 与编辑后自检用：读盘定位该船 component/macro 后做 R6 体检。
+    只读，不写任何文件。几何缺失按 error 计（模型不可见/船不可用）。"""
+    loc = _locate_ship(ship_id, source)
+    if not loc:
+        return {"ok": False, "ship": ship_id, "size": "", "errors": [
+            _lint_item("E_SHIP_NOT_FOUND", "error", "未找到舰船组件：%s（确认已解包且已部署到解包根）" % ship_id)],
+            "warnings": [], "stats": {}}
+    ctxt = _read_ship_comp_txt(loc["comp"], loc["size"], ship_id, loc["source"])
+    mtxt = ""
+    if loc["macro"]:
+        mtxt = open(loc["macro"], encoding="utf-8", errors="ignore").read()
+    res = lint_ship_texts(ship_id, loc["size"], ctxt, mtxt or None)
+    for w in verify_model_refs(mod or MOD_DIR, loc["comp"]):
+        res["errors"].append(_lint_item("E_GEO_MISSING", "error", w))
+    res["ok"] = not res["errors"]
+    res.update({"source": loc["source"], "component": os.path.relpath(loc["comp"], ROOT),
+                "macro_file": os.path.relpath(loc["macro"], ROOT) if loc["macro"] else ""})
+    return res
 
 _MACRO_CATALOG = None
 _MC_PREFIXES = ["dockarea_", "dock_", "bridge_", "launchtube_", "shipstorage_", "buildmodule_", "storage_"]
@@ -8172,6 +8345,15 @@ def _g_shipgroups(h):
     q = h._q()
     h._json(ship_in_groups((q.get("ship") or [""])[0]))
 
+def _g_shiplint(h):
+    # 舰船结构体检（R6）：只读，返回 errors/warnings 清单
+    q = h._q()
+    ship = (q.get("ship") or [""])[0]
+    if not ship:
+        h._json({"ok": False, "error": "缺参数 ship"}); return
+    mod = (q.get("mod") or [""])[0] or MOD_DIR
+    h._json(ship_lint(mod, ship, (q.get("source") or [""])[0] or None))
+
 def _g_shipsoftware(h):
     q = h._q()
     ship = (q.get("ship") or [""])[0]
@@ -8348,6 +8530,7 @@ _GET_EXACT = {
     "/api/docklist": lambda h: h._json(dock_list()),
     "/api/config": lambda h: h._json(load_config()),
     "/api/unpackstatus": _g_unpackstatus,
+    "/api/shiplint": _g_shiplint,
 }
 
 # 前缀匹配按顺序取首个命中
@@ -8393,10 +8576,12 @@ _GET_PREFIX = (
 )
 
 def _dispatch_get(h):
-    fn = _GET_EXACT.get(h.path)
+    # self.path 含查询串（/api/shiplint?ship=x），精确匹配前先剥离，否则会漏到静态文件兜底
+    path = h.path.split("?", 1)[0]
+    fn = _GET_EXACT.get(path)
     if fn is None:
         for pfx, f in _GET_PREFIX:
-            if h.path.startswith(pfx):
+            if path.startswith(pfx):
                 fn = f
                 break
     if fn is None:

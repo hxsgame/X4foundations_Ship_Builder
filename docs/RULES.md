@@ -56,8 +56,8 @@
 |---|---|
 | 规则 | **任一挂载连接的兼容标签数必须严格小于该船的升级组数 n**（`max(n_comp) < n`）。兼容标签 = 连接 tags ∩ {standard, missile, mining, highpower, venture, boron, xenon, advanced}（共 8 个）。建议按原版给每个组配护盾/引擎 |
 | 后果 | `n_comp > n` → 原版 `menu_ship_configuration.lua` 的 `setupGroupData()` 兼容缓冲越界 → 建造界面点炮塔**直接崩游戏**（dump 落在 `lua51_64.dll` 随机地址） |
-| 代码 | 目前仅人工遵守；`@Artists` 警告可从 debuglog 观察（`has only turrets in group 'X'!` / `has no shields in engine group 'X'!`） |
-| 备注 | 组数少的船（revelation 仅 3 组）最多带 2 个兼容标签；加标签前先数一遍 |
+| 代码 | **已自动校验（2026-11-12）**：`lint_ship_texts()`（纯文本核心）/ `ship_lint()`（读盘体检），server.py ~L4008 起；`GET /api/shiplint?ship=<id>` 只读体检；`generate` 写盘前发现 error 直接拒绝（`force=1` 强制），`edit` 只告警 |
+| 备注 | 组数少的船（revelation 仅 3 组）最多带 2 个兼容标签；加标签前先数一遍。回归测试 `tests/test_shiplint.py` 覆盖 5 标签/3 组→error、删到 2 个→放行 |
 
 ## R7 连接点与 macro 挂载
 
