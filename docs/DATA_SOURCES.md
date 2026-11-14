@@ -1,5 +1,7 @@
 # 数据源表与引用注册表
 
+> 共 **29 个数据源**、**75 条引用**（GET 接口 53：精确 15 / 前缀 38；POST 23，其中 2 条为 GET+POST 合并；静态页 1）。
+>
 > 本文件由 `python data_sources.py --md` 生成，**勿手改**；
 > 唯一事实源是 `data_sources.py`（SOURCES / APIS）。
 

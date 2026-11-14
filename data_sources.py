@@ -488,7 +488,15 @@ def match_api(path):
 
 def md():
     """生成 docs/DATA_SOURCES.md 的正文（唯一事实源本文件，文档只是快照）。"""
+    n_ge = sum(1 for m in APIS.values() if "GET" in (m.get("m") or "") and m.get("match") == "exact")
+    n_gp = sum(1 for m in APIS.values() if "GET" in (m.get("m") or "") and m.get("match") == "prefix")
+    n_p = sum(1 for m in APIS.values() if "POST" in (m.get("m") or ""))
+    n_both = sum(1 for m in APIS.values() if "+" in (m.get("m") or ""))
+    n_st = sum(1 for m in APIS.values() if m.get("match") == "static")
     lines = ["# 数据源表与引用注册表", "",
+             "> 共 **%d 个数据源**、**%d 条引用**（GET 接口 %d：精确 %d / 前缀 %d；POST %d，其中 %d 条为 GET+POST 合并；静态页 %d）。"
+             % (len(SOURCES), len(APIS), n_ge + n_gp, n_ge, n_gp, n_p, n_both, n_st),
+             ">",
              "> 本文件由 `python data_sources.py --md` 生成，**勿手改**；",
              "> 唯一事实源是 `data_sources.py`（SOURCES / APIS）。", "",
              "## 一、数据源表（SOURCES）", "",
