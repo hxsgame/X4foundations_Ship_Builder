@@ -3068,6 +3068,38 @@ const EQ_FIELDS = {
   ]
 };
 const EQ_SIZES_L = {shield:"护盾量/回复", turret:"转向/船体", weapon:"过热/转向/船体", missile:"射程/装填/质量"};
+// 装备跨尺寸（L↔XL）：只同步挂载 tags / ID 尺寸词 / 尺寸相关引用，模型网格不缩放
+const EQ_SIZE_WORDS = ["extralarge","large","medium","small","xs"];
+function eqTagsSwapSize(tags, tag){
+  if(!tag) return tags||"";
+  const a=(tags||"").split(/\s+/).filter(Boolean);
+  let hit=false;
+  const out=a.map(w=>{ if(!hit && EQ_SIZE_WORDS.includes(w)){ hit=true; return tag; } return w; });
+  if(!hit){ a.push(tag); return a.join(" "); }
+  return out.join(" ");
+}
+function eqIdSwapSize(id, short){
+  if(!id||!short) return id;
+  return id.replace(/(^|_)(s|m|l|xl)(?=_|$)/, (m,p1)=>p1+short);
+}
+function eqIdTouched(cls){ EQ[cls]._idAuto=false; }
+function eqSizeChange(cls){
+  const sel=document.getElementById("eqsz-"+cls); if(!sel) return;
+  const short=sel.value||"";
+  const tag = short==="xl" ? "extralarge" : (short==="l" ? "large" : "");
+  const ct=document.getElementById("eqctags-"+cls);
+  if(ct && tag){ ct.value=eqTagsSwapSize(ct.value, tag); eqTagSel(cls); }
+  const idEl=document.getElementById("eqid-"+cls);
+  if(idEl && short && EQ[cls]._idAuto){ idEl.value=eqIdSwapSize(idEl.value, short); }
+  if(!short){   // 回到「未识别」：恢复模板原值，避免 tags 与提交尺寸不一致
+    if(ct) ct.value=EQ[cls]._tplTags||"";
+    if(idEl && EQ[cls]._idAuto) idEl.value=EQ[cls]._tplId||"";
+  }
+  const h=document.getElementById("eqszhint-"+cls);
+  if(h) h.textContent = (short && EQ[cls]._tplSize && short!==EQ[cls]._tplSize)
+    ? `已切到 ${short.toUpperCase()}：保存时改写挂载 tags / ID 尺寸词 / 尺寸相关引用（目标资源缺失则保留原值并提示）；模型网格不缩放。`
+    : "只改挂载 tags / ID 尺寸词 / 尺寸相关引用，不缩放模型；要换外观请用「引用模型」。";
+}
 async function renderEquip(cls){
   const box = document.getElementById("eq-"+cls);
   const curSub = EQSUB[cls]||"";
@@ -3090,7 +3122,12 @@ async function renderEquip(cls){
         <input readonly id="geogeom-${cls}" style="width:100%;box-sizing:border-box;background:#0d1117;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:4px 6px" value="—">
         <div class="chaininfo" id="eqchain-${cls}"></div>
       </div>
-      <div id="eqfid-${cls}"><label>新装备 ID（${cls}_种族_尺寸_名称_mk1，导弹用 ${cls}_弹种_名称_mk1）</label><input id="eqid-${cls}" value=""></div>
+      <div id="eqfid-${cls}"><label>新装备 ID（${cls}_种族_尺寸_名称_mk1，导弹用 ${cls}_弹种_名称_mk1）</label><input id="eqid-${cls}" value="" oninput="eqIdTouched('${cls}')"></div>
+      ${["shield","turret","weapon","engine"].includes(cls) ? `<div id="eqszw-${cls}"><label>装备尺寸（跨尺寸 L↔XL）</label>
+        <select id="eqsz-${cls}" onchange="eqSizeChange('${cls}')">
+          <option value="">（未识别 / 非 L·XL）</option><option value="l">大型 L</option><option value="xl">超大型 XL</option>
+        </select>
+        <div class="hint" id="eqszhint-${cls}" style="margin-top:4px"></div></div>` : ""}
       <div><label>中文名称</label><input id="eqnamezh-${cls}" value=""></div>
       <div><label>英文名称</label><input id="eqnameen-${cls}" value=""></div>
       <div><label>中文描述</label><input id="eqdesczh-${cls}" value=""></div>
@@ -3317,6 +3354,8 @@ function eqMode(cls){
       document.getElementById("eqsn-"+cls).style.display = m==="new" ? "" : "none";
       document.getElementById("eqse-"+cls).style.display = m==="edit" ? "" : "none";
       document.getElementById("eqfid-"+cls).style.display = m==="new" ? "" : "none";
+      const _szm=document.getElementById("eqsz-"+cls);
+      if(_szm) _szm.disabled = (m==="edit") || !(EQ[cls]._tplSize==="l"||EQ[cls]._tplSize==="xl");
       if (changed) eqClear(cls,"all");
     }
   });
@@ -3354,6 +3393,20 @@ async function eqOnTpl(cls){
   // 建议新 ID = 模板 id + 后缀（用户可改；已含后缀则不再追加）
   const _sug = id.endsWith(ID_SUFFIX) ? id : id + ID_SUFFIX;
   document.getElementById("eqid-"+cls).value = _sug;
+  // 跨尺寸：默认跟随模板尺寸（仅 L/XL 可选；M/S 模板不开放跨尺寸）
+  const _sz=document.getElementById("eqsz-"+cls);
+  if(_sz){
+    const _short=r.size||"";
+    const _ok=(_short==="l"||_short==="xl");
+    EQ[cls]._tplSize=_short; EQ[cls]._idAuto=true;
+    EQ[cls]._tplTags=r.conn_tags||""; EQ[cls]._tplId=_sug;
+    _sz.value=_ok?_short:"";
+    _sz.disabled=!_ok;
+    const h=document.getElementById("eqszhint-"+cls);
+    if(h) h.textContent=_ok
+      ? "默认跟随模板尺寸；切换后保存会改写挂载 tags / ID 尺寸词 / 尺寸相关引用，不缩放模型。"
+      : "该模板尺寸不在 L/XL 范围（或未识别），不开放跨尺寸。";
+  }
   eqStatus(cls, `已读取模板 ${id}（源 ${srcLabel(r.source)}）`);
   showEqChain(cls, id);
   // 炮台：missileturret 显示弹药类别模块，普通炮塔隐藏
@@ -3405,6 +3458,15 @@ async function eqOnPick(cls){
   const ct = document.getElementById("eqctags-"+cls);
   if (ct){ ct.value = r.conn_tags||""; eqTagSel(cls); }
   eqOwnerSet(cls, r.owner||"");
+  // 修改模式：尺寸只读回显（不允许改尺寸，避免改名/移动文件）
+  const _szE=document.getElementById("eqsz-"+cls);
+  if(_szE){
+    const _s=r.size||""; EQ[cls]._tplSize=_s;
+    _szE.value=(_s==="l"||_s==="xl")?_s:"";
+    _szE.disabled=true;
+    const h=document.getElementById("eqszhint-"+cls);
+    if(h) h.textContent = _s ? `当前尺寸：${_s.toUpperCase()}（修改模式只读）` : "未识别到 L/XL 尺寸（修改模式只读）";
+  }
   const tm = document.getElementById("eqmod-"+cls);
   if (tm && tpl && tpl.source_path) tm.value = tpl.source_path;
   eqStatus(cls, `已读取 ${r.id}（源 ${srcLabel(r.source)}）`);
@@ -3949,6 +4011,10 @@ async function eqSave(cls){
     owner:eqOwnerGet(cls),
     conn_tags: cls==="missile" ? eqGet(cls,"eqf_"+cls+"_mount_tags") : eqGet(cls,"eqctags-"+cls),
     fields:{}, cost:eqCollectCost(cls) };
+  if(mode==="new"){
+    const _szEl=document.getElementById("eqsz-"+cls);
+    if(_szEl && ["shield","turret","weapon","engine"].includes(cls)) d.size=_szEl.value||"";
+  }
   EQ_FIELDS[cls].forEach(f=>{
     let v = eqFget(cls,f.k);
     if (f.k==="bullet" && v) v = v.split("@@")[0];  // 弹药宏只传纯 macro 名（选项 value 含 @@source）

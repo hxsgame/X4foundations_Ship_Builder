@@ -1,7 +1,7 @@
 # EVE_Ship_Builder 工程维护文档
 
-> 最后更新：2026-11-12
-> 适用版本：当前主干（server.py 8883 行 + index.html 4046 行 单文件架构）
+> 最后更新：2026-11-14
+> 适用版本：当前主干（server.py 9273 行 + index.html 4112 行 单文件架构）
 > 铁律索引：[RULES.md](RULES.md)（规则 → 代码位置，本文档只讲"为什么"与事故过程）
 
 ---
@@ -10,9 +10,9 @@
 
 | 项目 | 值 |
 |---|---|
-| 工程根目录 | `C:\Users\15536\Doubao\chats\2026-10-03\new-chat-1\EVE_Ship_Builder\` |
-| 前端 | `index.html`（单文件 4046 行，含全部 JS/CSS，原生 ES6） |
-| 后端 | `server.py`（单文件 8883 行，Python 3.9+ 原生 `http.server`） |
+| 工程根目录 | `C:\Users\15536\Documents\Trae-CN\projects\EVE_Ship_Builder\` |
+| 前端 | `index.html`（单文件 4112 行，含全部 JS/CSS，原生 ES6） |
+| 后端 | `server.py`（单文件 9273 行，Python 3.9+ 原生 `http.server`） |
 | 启动方式 | 双击 `启动服务.bat` 或 `python server.py`，浏览器访问 `http://127.0.0.1:8765` |
 | X4 解包根 | `D:\Games\X4 exout` |
 | 当前目标 Mod | `UP7_Real_EVE_Ships` |
@@ -253,8 +253,8 @@ modeSwitchEx(key, newMode, clearSels, onApply)
 
 ```
 EVE_Ship_Builder/
-├── index.html                 ← 前端单文件（全部 UI + JS，4046 行）
-├── server.py                  ← 后端单文件（全部 API + X4 解析，8883 行）
+├── index.html                 ← 前端单文件（全部 UI + JS，4112 行）
+├── server.py                  ← 后端单文件（全部 API + X4 解析，9273 行）
 ├── x4_lookup.py               ← t 文本/名称解析（X4Lookup）
 ├── 启动服务.bat                ← 双击启动（python server.py :8765）
 ├── builder_config.json        ← 本机配置（root / target_mod / id_suffix，gitignore）
@@ -263,7 +263,7 @@ EVE_Ship_Builder/
 ├── backup_workdir_to_D.ps1    ← 工作目录镜像备份（gitignore）
 ├── _shipmodel_backup/         ← 生成/编辑自动备份（滚动 3 次）
 ├── cache/                     ← 扫描缓存（gitignore）
-├── tests/                     ← 主测试套件（10 文件 / 45 项）
+├── tests/                     ← 主测试套件（12 文件 / 63 项）
 ├── docs/
 │   ├── MAINTENANCE.md         ← 本文件（架构 + 模块 + 事故日志）
 │   ├── RULES.md               ← 铁律索引（规则 → 代码位置）
@@ -296,6 +296,7 @@ EVE_Ship_Builder/
 
 | 日期 | 内容 |
 |---|---|
+| 2026-11-12 | **装备新增支持跨尺寸（仅 L↔XL）**：`equip_generate()` 新增 `size` 参数（默认跟随模板；非法/不支持直接拒绝），前端 ① 卡片加「装备尺寸」下拉（修改模式只读）。改写链路：`_resize_mount_tags()` 改主挂载连接 tags 尺寸词（缺词补在类型词后；用户显式 `conn_tags` 优先）→ `_swap_size_token()` 改 ID/宏名尺寸词（不一致仅 warning）→ `_resize_refs()` 改弹丸 / 引擎 boosting·traveling·enginedetail / 炮塔 damage 特效引用（目标尺寸资源不存在则保留原值并提示，不制造悬空 ref）。原版引用模板跨尺寸时强制复制组件以写入新 tags；生成结果与内存缓存 `sizes` 写目标尺寸。模型网格不缩放（与 mod 现状一致：XL 装备共用 L 模型），换外观走「引用模型」。回归 `tests/test_equip_size.py` 11 项 |
 | 2026-11-12 | **新增 R6 舰船结构校验器（lint）**：`lint_ship_texts()`（纯文本核心）+ `ship_lint()`（读盘）+ `GET /api/shiplint?ship=<id>`（server.py ~L4008 起）。检查项：兼容标签越界 `E_COMPAT_OVERFLOW`（致命：`max_compat >= groups`）、macro 悬空引用 `E_DANGLING_REF`、内挂宏入口非法 `E_BAD_MACRO_ENTRY`、geometry 缺失 `E_GEO_MISSING`、组结构警告 `W_GROUP_ONLY_TURRET` / `W_ENGINE_NO_SHIELD`、装配槽位缺失 `W_LOADOUT_PATH`、尺寸目录不一致 `W_GEO_SIZE_MISMATCH`。`generate` 在写盘前拦截（`force=1` 可强制），`edit` 只告警不拦截；回归测试 `tests/test_shiplint.py` 7 项。顺带修正 `_dispatch_get` 未剥离查询串导致精确路由带参数时落到静态文件的问题 |
 | 2026-11-12 | **文档体系三分工 + 一致性收口（无代码改动）**：① 新建 [RULES.md](RULES.md)（R1~R13 铁律 → 代码位置 + 验证清单）；② README 修正行数（server.py 8883 / index.html 4046）、补充完整目录树、重写选项卡表（补引擎/解包/Diff）、接口速查改为按域分组（GET 51 / POST 23）、测试表补 `tests/` 10 文件、待办只留 POST 路由化/前端收敛/拆模块；③ 本文件修正「最后更新」、§1 持久化与备份路径（`builder_config` 实际字段、`_shipmodel_backup\`）、§2.1 卡片表按真实 UI 顺序重写（①~⑨ + 软件 + ⑥-1/⑤-1/⑧-1）、§2.2 装备改为「5 选项卡 + 弹药两子页」、§7 文件清单重写；④ 交接文档（2026-10-12）降级归档至 `docs/archive/`，标题去掉「唯一基准」并加过时提示 |
 | 2026-11-08 | **revelation 建造界面点炮塔崩溃定位（原版 UI 兼容缓冲越界，用户实测修复）**：现象=点 `ship_par_xl_revelation` 炮塔槽直接崩、无 Lua 报错，minidump 落在 `lua51_64.dll` 且为写 `0x2EF10A11` / 读 `0x23` 等随机地址。根因=原版 `ui/addons/ego_detailmonitor/menu_ship_configuration.lua` 的 `setupGroupData()`（约 11300-11325 行）按升级组数 `n` 分配 `EquipmentCompatibilityInfo[?]` 缓冲、却按兼容标签数 `n_comp` 调 `C.GetUpgradeGroupCompatibilities()` 写入，`n_comp > n` 时堆越界（LuaJIT 内存损坏 → 随机地址 AV）。本例炮塔连接 tags 含 `standard advanced highpower missile boron` 共 5 个兼容标签，而全船只 3 个组（eng_g_01/left_g_01/right_g_01）→ 5 > 3。**用户删掉 3 个 tags 后 n_comp=2 < 3，崩溃消失，确认根因**。同时核查并排除：放大炮塔 `turret_par_l_plasma_01_mk1_x150` 与原版逐字段一致且 `large` 标签不进 `extralarge` 槽；舰船 xml 无 `<mesh>` 属正常（naglfar 同构）。已在 §4.3 补充铁律：**任一连接的兼容标签数必须严格小于该船升级组数**；同船 `has only turrets in group 'X'!` / `has no shields in engine group 'X'!` @Artists 警告可作结构预警 |

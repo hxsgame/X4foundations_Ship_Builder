@@ -5,6 +5,7 @@ node_modules/
 /0
 builder_config.json
 _backup/
+_jobs_test_tmp/
 backup_workdir_to_D.ps1
 dist/
 server_out.log

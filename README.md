@@ -47,8 +47,8 @@ Start-Sleep 8 → 再查 8765 监听确认
 
 ```
 EVE_Ship_Builder/
-├─ server.py              后端主程序（路由 + 舰船/装备/特效生成，8883 行）
-├─ index.html             前端单页（10 个选项卡，4046 行）
+├─ server.py              后端主程序（路由 + 舰船/装备/特效生成，9273 行）
+├─ index.html             前端单页（10 个选项卡，4112 行）
 ├─ x4_lookup.py           X4 文本/名称解析（X4Lookup 类，210 行）
 ├─ 启动服务.bat            双击启动（python server.py，端口 8765）
 ├─ builder_config.json    本机配置（root / target_mod / mode / backup_root / id_suffix，gitignore）
@@ -56,7 +56,7 @@ EVE_Ship_Builder/
 ├─ build_release.ps1      发布打包（白名单 4 文件 → dist/*.zip）
 ├─ backup_workdir_to_D.ps1 工作目录镜像备份（robocopy /MIR → D:\TraeCN backup）
 ├─ release/               发布包文本模板（使用说明.txt）
-├─ tests/                 主测试套件（10 个文件 / 45 项）
+├─ tests/                 主测试套件（12 个文件 / 63 项）
 ├─ docs/                  文档
 │   ├─ MAINTENANCE.md     维护文档（架构、模块、事故日志）
 │   ├─ RULES.md           铁律索引（规则 → 代码位置）
@@ -64,12 +64,12 @@ EVE_Ship_Builder/
 │   ├─ BLENDER_组件缩放导出需求.md
 │   ├─ 项目总结与优化报告_2026-11-06.md
 │   └─ archive/           历史文档（含 2026-10-12 交接文档）
-├─ tools/                 历史一次性脚本（scan_*、_* 调试/补丁）
+├─ tools/                 工具/沙箱测试脚本（_dockclone_test / _wp_group_test）
 ├─ x4_wp_export.py        waypoint 导出旧脚本（已不维护，统一走 Blender 插件面板）
 └─ *_test.py              根目录旧回归脚本（build/jobs/loadout/edit）
 ```
 
-`scan_*.py`、`_*.py` 均为历史一次性脚本，与运行时无关，可归档到 `tools/`（见"优化建议"）。
+`tools/` 下仅保留仍在用的沙箱测试脚本；一次性 `scan_*.py` / `_*.py` 已于 2026-11-14 清理。
 
 ---
 
@@ -89,6 +89,7 @@ EVE_Ship_Builder/
 - **新增/修改**都读模板数据；新增时按目标类复制资源并改名。
 - 引用链：`macro → component(component ref=) → source geometry(几何) → data(bullet)`，工具自动发现并回填完整路径。
 - **模型链铁律**：五类装备统一——**原版和 DLC 资源指向引用**（复用原资源、不复制）；**mod 资源整套复制改名**。
+- **跨尺寸（L↔XL）**：新增时可指定目标尺寸（默认跟随模板），支持炮台/主武器/护盾/引擎。切换后自动改写：挂载连接 tags 尺寸词、新 ID 尺寸词（可手动覆盖，不一致会提示）、尺寸相关引用（弹丸 / 引擎推进·超速·声音 / 炮台伤害特效）；目标尺寸资源不存在时保留原值并提示；**不缩放模型网格**（要换外观请用「引用模型」）。修改模式尺寸只读。
 
 ---
 
@@ -249,12 +250,14 @@ EVE_Ship_Builder/
 
 ## 七、测试脚本（回归用）
 
-**主测试套件 `tests/`（unittest，45 项）**：`.\run_tests.ps1` 或 `python -m unittest discover -s tests -v`
+**主测试套件 `tests/`（unittest，63 项）**：`.\run_tests.ps1` 或 `python -m unittest discover -s tests -v`
 
 | 文件 | 覆盖 |
 |---|---|
 | `test_geometry.py` | geometry 归属/改写（`geo_owned` / `geo_rebase`） |
 | `test_equip_fields.py` | 装备字段读写往返 |
+| `test_equip_size.py` | 装备跨尺寸 L↔XL（挂载 tags / ID 尺寸词 / 引用改写与保留提示） |
+| `test_shiplint.py` | 舰船结构校验（R6：兼容标签越界等） |
 | `test_registry.py` | index 注册统一 |
 | `test_transaction.py` | 写入事务/回滚 |
 | `test_cache_groups.py` | 缓存分组失效 |
@@ -266,23 +269,24 @@ EVE_Ship_Builder/
 
 **根目录旧脚本（历史回归，未纳入 runner）**：`build_test.py`（舰船新增）、`jobs_test.py`（jobs）、`test_edit.py`（舰船修改）、`test_loadout.py`（装配预设）。
 
-`tools/` 下的 `scan_*.py`、`_*.py` 为一次性提取/调试脚本，留作溯源，不参与运行。
+`tools/` 下仅保留沙箱测试脚本（`_dockclone_test.py`、`_wp_group_test.py`），一次性提取/调试脚本已于 2026-11-14 清理。
 
 ---
 
 ## 八、优化建议（待办）
 
 **已落地**：
+- ✅ 装备跨尺寸 L↔XL：新增炮台/主武器/护盾/引擎时可选目标尺寸，自动改写挂载 tags / ID 尺寸词 / 尺寸相关引用（目标资源缺失保留原值+提示），不缩放模型。
 - ✅ 扫描缓存刷新：顶部"刷新数据"按钮 + `/api/refresh` → `refresh_caches()`，运行中往 mod 加物品后无需重启服务。
 - ✅ 模型引用完整性抽查：`verify_model_refs()` 在生成后只读校验几何引用，缺失以黄色 warnings 展示（不阻断）。
-- ✅ 历史脚本归档：`scan_*.py`、`_*.py` 移到 `tools/`。
+- ✅ 历史脚本治理：一次性 `scan_*.py`、`_*.py` 先归档到 `tools/`，2026-11-14 清理（仅留沙箱测试）。
 - ✅ 2026-11-06 重构 0~7 步：geometry 单点化（`geo_owned/geo_rebase`）、`_EQ_FIELDS` 单一数据源、`upsert_effect/finish_write` 收敛、`_json/_q/_body` + **GET 路由表**、`register_assets` 统一注册、`_txn` 写入事务化、`CACHE_GROUPS` 缓存分组、`tests/` + `run_tests.ps1`。
 - ✅ 端口占用提示：服务启动已内置（占用时直接打开页面）。
 
 **保留待办**：
 1. **POST 路由表化**：`do_POST` 仍是「白名单 + elif 链」（新增接口要改两处，易漏），GET 侧已完成。
 2. **前端收敛**：80 处裸 `fetch` 无统一 `api()`；`esc/escHtml`、状态提示 4 套、目录选择 3 套并存。
-3. **P2 拆模块**：`server.py` 已 8883 行，建议功能冻结窗口拆为 `http_app / assets / xmlpatch / ship / equip / effects / dock / cache`（接口契约不变，前端零改动）。
+3. **P2 拆模块**：`server.py` 已 9273 行，建议功能冻结窗口拆为 `http_app / assets / xmlpatch / ship / equip / effects / dock / cache`（接口契约不变，前端零改动）。
 
 ---
 

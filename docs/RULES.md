@@ -120,7 +120,7 @@
 ## 验证清单（每次改代码后）
 
 1. `python -c "import ast; ast.parse(open('server.py',encoding='utf-8').read())"`
-2. `.\run_tests.ps1`（unittest 45 项 + ast）
+2. `.\run_tests.ps1`（unittest 63 项 + ast）
 3. 改 index.html 后：`node --check` 抽取的 JS 块（或浏览器控制台无语法错误）
 4. **结束 8765 旧进程再重启**，冒烟 `/api/templates`、`/api/config`
 5. 涉及 X4 结构的改动：Vortex Deploy → 进游戏 → 看 `Documents\Egosoft\X4\<id>\debuglog.txt` 有无 LIBXML2 / `@Artists` / meshsource 报错

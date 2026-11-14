@@ -2,7 +2,7 @@
 """dock_clone / dock_list 沙箱验证（临时目录，不动真实 mod）。"""
 import importlib.util, json, os, shutil, sys, tempfile
 
-BASE = r"C:\Users\15536\Doubao\chats\2026-10-03\new-chat-1\EVE_Ship_Builder"
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
 spec = importlib.util.spec_from_file_location("server", os.path.join(BASE, "server.py"))
 srv = importlib.util.module_from_spec(spec)

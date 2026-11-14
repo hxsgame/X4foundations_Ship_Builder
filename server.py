@@ -3548,6 +3548,9 @@ def shipgroup_clear(mod, ship_id):
 _LOADOUT_CACHE = None
 _MACRO_REF_RE = re.compile(r'<component\s+ref="([^"]+)"')
 _SIZE_WORDS = ("extralarge", "large", "medium", "small", "xs")
+# 装备跨尺寸（仅 L↔XL，与舰船 ⑤ 的 l/xl 对齐）：短码 ↔ 挂载连接尺寸词
+_EQ_SIZE_TAG = {"l": "large", "xl": "extralarge"}
+_EQ_SIZE_SHORT = {"large": "l", "extralarge": "xl"}
 _COMPCACHE = {}
 def _read_macro_ref(macfile):
     """从装备 macro 读它引用的 component id（结构规则：<component ref>）。"""
@@ -3754,6 +3757,163 @@ def _set_mount_tags(ctxt, tags, conn_name=""):
             seg = seg.replace(tm.group(0), 'tags="%s"' % tags)
             return ctxt[:m.start()] + seg + ctxt[m.end():]
     return ctxt
+
+# ---------- 装备跨尺寸（L↔XL，参照舰船 ⑤ 的 size 实现）----------
+_EQ_MOUNT_TYPES = ("turret", "missileturret", "weapon", "shield", "missile", "engine")
+
+def _eq_size_tag(v):
+    """装备尺寸短码/尺寸词 → 挂载连接尺寸词（l→large / xl→extralarge）；非法返回空串。"""
+    v = (v or "").strip().lower()
+    if v in _EQ_SIZE_TAG:
+        return _EQ_SIZE_TAG[v]
+    if v in ("large", "extralarge"):
+        return v
+    return ""
+
+def _eq_size_of_tags(tags):
+    """从挂载 tags 反解尺寸短码（只认 L/XL，其余返回空串）。"""
+    ts = (tags or "").split()
+    for w in _SIZE_WORDS:
+        if w in ts:
+            return _EQ_SIZE_SHORT.get(w, "")
+    return ""
+
+def _eq_size_of_name(name):
+    """从标识符（ID/宏名）里取第一处尺寸短码（只认 l/xl）。"""
+    m = re.search(r'_(s|m|l|xl)(?=_|$)', name or "")
+    return m.group(1) if m and m.group(1) in _EQ_SIZE_TAG else ""
+
+def _swap_size_token(name, short):
+    """把标识符里第一处尺寸词换成目标短码：
+    turret_par_l_beam → turret_par_xl_beam；gen_traveldrive_fx_l → gen_traveldrive_fx_xl。
+    无尺寸词或短码非法时原样返回。"""
+    if not name or short not in _EQ_SIZE_TAG:
+        return name
+    return re.sub(r'_(s|m|l|xl)(?=_|$)', "_" + short, name, count=1)
+
+def _resize_mount_tags(ctxt, size_tag, conn_name=""):
+    """把组件「主挂载连接」tags 的尺寸词改为 size_tag（其余词与顺序不变；无尺寸词则补在类型词后）。
+    优先按 conn_name 精确定位。返回 (新文本, 状态)：replaced / added / same / nomount。"""
+    if not size_tag:
+        return ctxt, "same"
+    hits = []                     # (match, seg, tags_match, tags_list, name)
+    for m in re.finditer(r'<connection\b[^>]*>', ctxt):
+        seg = m.group(0)
+        tm = re.search(r'\btags="([^"]*)"', seg)
+        if not tm:
+            continue
+        ts = tm.group(1).split()
+        if not any(t in ts for t in _EQ_MOUNT_TYPES):
+            continue
+        nm = re.search(r'\bname="([^"]*)"', seg)
+        hits.append((m, seg, tm, ts, nm.group(1) if nm else ""))
+    if conn_name:
+        hits = [h for h in hits if h[4] == conn_name] or hits
+    if not hits:
+        return ctxt, "nomount"
+    m, seg, tm, ts, _nm = hits[0]
+    if size_tag in ts:
+        return ctxt, "same"
+    old = [w for w in _SIZE_WORDS if w in ts]
+    if old:
+        ts[ts.index(old[0])] = size_tag
+        status = "replaced"
+    else:
+        i2 = next((i for i, w in enumerate(ts) if w in _EQ_MOUNT_TYPES), len(ts) - 1)
+        ts.insert(i2 + 1, size_tag)
+        status = "added"
+    newseg = seg.replace(tm.group(0), 'tags="%s"' % " ".join(ts))
+    return ctxt[:m.start()] + newseg + ctxt[m.end():], status
+
+_LIB_NAME_CACHE = {}
+def _lib_names(kind):
+    """libraries/effects.xml 的 <effect name> / sound_library.xml 的 <group id> 名称集合
+    （原版 + 全部扩展取并集，缓存）。kind='effect'|'sound'。"""
+    key = (ROOT, kind)
+    if key in _LIB_NAME_CACHE:
+        return _LIB_NAME_CACHE[key]
+    fn, pat = (("effects.xml", r'<effect\s+name="([^"]+)"') if kind == "effect"
+               else ("sound_library.xml", r'<group\s+id="([^"]+)"'))
+    bases = [os.path.join(ROOT, "libraries")]
+    ext = os.path.join(ROOT, "extensions")
+    if os.path.isdir(ext):
+        bases += [os.path.join(ext, m, "libraries") for m in sorted(os.listdir(ext))]
+    names = set()
+    for b in bases:
+        p = os.path.join(b, fn)
+        if not os.path.isfile(p):
+            continue
+        try:
+            names.update(re.findall(pat, open(p, encoding="utf-8", errors="ignore").read()))
+        except OSError:
+            continue
+    _LIB_NAME_CACHE[key] = names
+    return names
+
+def _bullet_name_exists(mid):
+    """弹丸宏 id（可带 _macro）是否存在。"""
+    bid = mid[:-len("_macro")] if mid.endswith("_macro") else mid
+    try:
+        return bid in bullet_scan()
+    except Exception:
+        return False
+
+def _resize_refs(mtxt, cls, short, fields=None):
+    """按目标尺寸改写 macro 的尺寸相关引用（弹丸/炮塔伤害特效/引擎推进·超速·声音）。
+    目标尺寸资源不存在时保留原值并告警（不制造悬空 ref）。返回 (新文本, [警告])。
+    fields 中与模板不同的用户值视为显式指定，不覆盖。"""
+    fields = fields or {}
+    warns = []
+    if not short:
+        return mtxt, warns
+
+    def _swap(ref, kind):
+        new = _swap_size_token(ref, short)
+        if new == ref:
+            return ref
+        ok = _bullet_name_exists(new) if kind == "bullet" else (new in _lib_names(kind))
+        if ok:
+            return new
+        warns.append("目标尺寸引用不存在，保留原值：%s" % ref)
+        return ref
+
+    mcls = ""
+    mc = re.search(r'<macro\b[^>]*\bclass="([^"]*)"', mtxt)
+    if mc:
+        mcls = mc.group(1)
+    # 弹丸引用：导弹发射塔的 bullet 指向导弹宏（无尺寸概念），跳过
+    if cls in ("turret", "weapon") and mcls != "missileturret" and not (fields.get("bullet") or "").strip():
+        m = re.search(r'(<bullet\s+class=")([^"]+)(")', mtxt)
+        if m:
+            new = _swap(m.group(2), "bullet")
+            if new != m.group(2):
+                mtxt = mtxt.replace('class="%s"' % m.group(2), 'class="%s"' % new, 1)
+    if cls == "turret":
+        # 伤害特效（ref="surfacemodule_damage_l_high" 等）：有目标尺寸才换，否则统一提示
+        kept = []
+        for old in sorted(set(re.findall(r'ref="([^"]*damage_[^"]+)"', mtxt))):
+            new = _swap_size_token(old, short)
+            if new == old:
+                continue
+            if new in _lib_names("effect"):
+                mtxt = mtxt.replace('ref="%s"' % old, 'ref="%s"' % new)
+            elif old not in kept:
+                kept.append(old)
+        if kept:
+            warns.append("目标尺寸的伤害特效不存在，已保留原值（视觉特效，不影响功能）：%s"
+                         % ", ".join(kept))
+    if cls == "engine":
+        for tag, kind, fkey in (("boosting", "effect", "boosting_ref"),
+                                ("traveling", "effect", "traveling_ref"),
+                                ("enginedetail", "sound", "sound_detail")):
+            if (fields.get(fkey) or "").strip():
+                continue
+            m = re.search(r'(<%s\s+ref=")([^"]+)(")' % tag, mtxt)
+            if m:
+                new = _swap(m.group(2), kind)
+                if new != m.group(2):
+                    mtxt = mtxt.replace('ref="%s"' % m.group(2), 'ref="%s"' % new, 1)
+    return mtxt, warns
 
 def write_mount_tags(ctxt, items):
     """把舰船 component 里指定 connection 的 tags 设置为给定值（按挂载点 name 精确定位）。
@@ -4393,7 +4553,7 @@ def write_loadout(mod, mac_name, ld, size):
         m = re.search(r'<loadouts>', txt)
         txt = txt[:m.end()] + '\n\t\t\t\t' + body + txt[m.end():]
     else:
-        m = re.search(r'<macro[^>]*>', txt)
+        m = re.search(r'<macro\b[^>]*>', txt)
         if not m: return []
         txt = txt[:m.end()] + '\n\t\t<loadouts>\n\t\t\t' + body + '\n\t\t</loadouts>' + txt[m.end():]
     write_text(ship_mac, txt)
@@ -5760,6 +5920,7 @@ def equip_read(cls, eid, source="", mod=""):
     return {"ok": True, "cls": cls, "id": eid, "source": it["source"],
             "meta": _eq_meta(cls, eid), "ident": ident, "fields": fields, "cost": cost,
             "ref": ref, "model": model, "conn_tags": conn_tags, "conn_name": conn_name, "owner": owner,
+            "size": _eq_size_of_tags(conn_tags),
             "trail_name": trail_name, "trail_type": trail_type, "explosion_ref": explosion_ref,
             "mt_class": mt_class, "visual": visual}
 
@@ -6132,6 +6293,19 @@ def equip_generate(d):
     tpl = next((t for t in equip_templates(cls) if t["id"] == tpl_id and (not tpl_src or t["source"] == tpl_src)), None)
     if not tpl:
         return {"ok": False, "error": "请选择模板装备"}
+    # 跨尺寸（L↔XL，参照舰船 ⑤）：默认跟随模板尺寸；只改挂载 tags / ID 尺寸词 / 尺寸相关引用，
+    # 不缩放模型网格（与 mod 现状一致：XL 装备共用 L 模型）。要换外观请用「引用模型」。
+    _szs = [s for s in (tpl.get("sizes") or []) if s in _EQ_SIZE_SHORT]
+    tpl_short = _EQ_SIZE_SHORT[sorted(_szs, key=lambda s: ("large", "extralarge").index(s))[0]] if _szs else ""
+    size_req = (d.get("size") or "").strip().lower()
+    size_tag = _eq_size_tag(size_req) if size_req else _EQ_SIZE_TAG.get(tpl_short, "")
+    if size_req and not size_tag:
+        return {"ok": False, "error": "装备尺寸无效：%s（仅支持 l / xl）" % size_req}
+    if size_tag and size_tag not in EQUIP_CLASSES[cls]["sizes"]:
+        return {"ok": False, "error": "%s 不支持尺寸 %s" % (EQUIP_CLASSES[cls]["label"], size_tag)}
+    size_short = _EQ_SIZE_SHORT.get(size_tag, "")
+    resized = bool(size_short and size_short != tpl_short)
+    _size_warns = []
     mod = os.path.normpath(d.get("target_mod") or MOD_DIR)
     # 模板源目录（按所选来源定位宏，多来源时读对应来源文件）
     src_mac = None
@@ -6204,14 +6378,16 @@ def equip_generate(d):
         created += [wrel(p) for p in cre]
         if not copied:
             comp_ref = model_ref   # 该装备无自有组件（复用官方/其他），回退直接指回，不复制
-    elif conn_tags:
-        # 原版/DLC 模型 + 自定义挂载 tags：复制模板组件改名（geometry 指回原模型 data），写 tags，component ref=new_id
+    elif conn_tags or resized:
+        # 原版/DLC 模型 + 自定义挂载 tags / 跨尺寸：复制模板组件改名（geometry 指回原模型 data），
+        # 写 tags，component ref=new_id
         tpl_src_id = model_ref
         src_comp = os.path.join(src_comp_dir, tpl_src_id + ".xml")
         if os.path.isfile(src_comp):
             ctxt = _read_comp_txt(src_comp)
             ctxt = ctxt.replace('name="%s"' % tpl_src_id, 'name="%s"' % new_id)
-            ctxt = _set_mount_tags(ctxt, conn_tags, conn_name)
+            if conn_tags:
+                ctxt = _set_mount_tags(ctxt, conn_tags, conn_name)
             os.makedirs(dst_comp_dir, exist_ok=True)
             dp = os.path.join(dst_comp_dir, new_id + ".xml")
             write_text(dp, ctxt)
@@ -6227,12 +6403,39 @@ def equip_generate(d):
             write_text(_nc, _c2)
             if wrel(_nc) not in created:   # 仅记录本次新建（原件保留不计入回滚）
                 created.append(wrel(_nc))
+    # 1.6 跨尺寸：改写复制后组件的挂载 tags（用户显式 conn_tags 优先，仅校验提示）
+    if resized:
+        _nc = os.path.join(dst_comp_dir, new_id + ".xml")
+        if os.path.isfile(_nc):
+            if conn_tags:
+                if size_tag not in conn_tags.split():
+                    _size_warns.append("挂载 tags 未包含所选尺寸 %s，已按你填写的内容写入" % size_tag)
+            else:
+                _ct = open(_nc, encoding="utf-8", errors="ignore").read()
+                _ct2, _st = _resize_mount_tags(_ct, size_tag, conn_name)
+                if _st in ("replaced", "added"):
+                    write_text(_nc, _ct2)
+                elif _st == "nomount":
+                    _size_warns.append("组件未找到挂载连接，尺寸标签未改写")
+        else:
+            _size_warns.append("模板无自有组件（虚拟/复用原版），尺寸仅影响 ID 与尺寸相关引用")
+        _id_short = _eq_size_of_name(new_id)
+        if _id_short and _id_short != size_short:
+            _size_warns.append("新装备 ID 的尺寸词为 %s，与所选尺寸 %s 不一致" % (_id_short, size_short))
     # 2. 写 macro properties
     mtxt = open(src_mac, encoding="utf-8", errors="ignore").read()
     mtxt = mtxt.replace('name="%s_macro"' % tpl["id"], 'name="%s_macro"' % new_id)
     mtxt = re.sub(r'(<component\s+ref=")[^"]*(")', r'\g<1>%s\g<2>' % comp_ref, mtxt, count=1)
     fields = d.get("fields") or {}
+    _tpl_fields = _read_equip_fields(cls, mtxt)   # 模板原值：用于区分「用户显式改过」与「前端回填」
     mtxt = _apply_equip_fields(cls, mtxt, fields)
+    if resized:
+        _user_refs = {k: (fields.get(k) or "").strip() for k in
+                      ("bullet", "boosting_ref", "traveling_ref", "sound_detail")
+                      if (fields.get(k) or "").strip() and
+                      (fields.get(k) or "").strip() != (_tpl_fields.get(k) or "").strip()}
+        mtxt, _rw = _resize_refs(mtxt, cls, size_short, _user_refs)
+        _size_warns += _rw
     # 修正 identification 的 t 引用：模板 identification 常引用原版 page（如 20105），
     # 与工具写入 7777771 页的名称/描述不一致，百科无法正确显示。统一替换为新分配 t id。
     name_tid, desc_tid = _alloc_tids(mod)
@@ -6259,7 +6462,8 @@ def equip_generate(d):
     copy_to_moding(mod, created + modified)
     # 把新装备并入扫描缓存，供同进程内立即编辑命中（source=目标 mod 名）
     equip_scan().setdefault(cls, {})[new_id] = {"id": new_id, "path": mdp, "cls": cls,
-                                                "source": os.path.basename(mod), "sizes": tpl["sizes"]}
+                                                "source": os.path.basename(mod),
+                                                "sizes": [size_tag] if size_tag else tpl["sizes"]}
     # 复制改名后模型引用完整性抽查（只读，不阻断）
     dst_comp_p = os.path.join(dst_comp_dir, new_id + ".xml")
     # 尾焰：勾选"新增尾焰"才创建专属特效并让组件引用新 type
@@ -6289,10 +6493,11 @@ def equip_generate(d):
             for _c in eb.get("created") or []:
                 if _c not in created:
                     created.append(_c)
-    warns = _warns + (verify_model_refs(mod, dst_comp_p) if os.path.isfile(dst_comp_p) else [])
+    warns = _size_warns + _warns + (verify_model_refs(mod, dst_comp_p) if os.path.isfile(dst_comp_p) else [])
     eq_cache_refresh_source(mod)  # 装备缓存增量维护：仅重扫本 mod props 合并回缓存（免全盘冷扫）
     _refresh_soft()               # t文本+wares索引+组件内容缓存失效（中英文名回填即时）
-    return {"ok": True, "id": new_id, "cls": cls, "created": created, "modified": modified,
+    return {"ok": True, "id": new_id, "cls": cls, "size": size_short,
+            "created": created, "modified": modified,
             "moding": os.path.join(mod, "moding"), "warnings": warns}
 
 def _backup_before_edit(path, tag):
