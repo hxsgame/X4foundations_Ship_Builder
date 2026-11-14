@@ -129,7 +129,7 @@
 ## 验证清单（每次改代码后）
 
 1. `python -c "import ast; ast.parse(open('server.py',encoding='utf-8').read())"`
-2. `.\run_tests.ps1`（unittest 72 项 + ast）
+2. `.\run_tests.ps1`（unittest 78 项 + ast）
 3. 改 index.html 后：`node --check` 抽取的 JS 块（或浏览器控制台无语法错误）
 4. 改数据源/接口后：`python data_sources.py` + `python data_sources.py --md` 重生成 `docs/DATA_SOURCES.md`
 5. **结束 8765 旧进程再重启**，冒烟 `/api/templates`、`/api/config`、`/api/sources`

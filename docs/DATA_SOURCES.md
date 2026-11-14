@@ -153,5 +153,5 @@
 
 ## 四、运行时可查
 
-- `GET /api/sources`：返回本表 + 当前配置下每个源展开后的真实路径、是否存在、被谁引用、问题清单。
-- `python data_sources.py`：启动前自检（退出码非 0 即有问题）。
+- `GET /api/sources`：返回本表 + 当前配置下每个源展开后的真实路径、是否存在、被谁引用、`problems`（硬问题，决定 `ok`）与 `warnings`（可选源已配置但路径不存在，仅提示）。
+- `python data_sources.py`：启动前自检（`problems` 非空则退出码非 0；`warnings` 只打印）。

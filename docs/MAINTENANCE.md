@@ -264,7 +264,7 @@ EVE_Ship_Builder/
 ├── backup_workdir_to_D.ps1    ← 工作目录镜像备份（gitignore）
 ├── _shipmodel_backup/         ← 生成/编辑自动备份（滚动 3 次）
 ├── cache/                     ← 扫描缓存（gitignore）
-├── tests/                     ← 主测试套件（13 文件 / 72 项）
+├── tests/                     ← 主测试套件（14 文件 / 78 项）
 ├── docs/
 │   ├── MAINTENANCE.md         ← 本文件（架构 + 模块 + 事故日志）
 │   ├── RULES.md               ← 铁律索引（规则 → 代码位置）
@@ -298,6 +298,8 @@ EVE_Ship_Builder/
 
 | 日期 | 内容 |
 |---|---|
+| 2026-11-14 | **自检分级 + 健壮性收口**：`check()` 新增 `warnings`（可选源"已配置但路径不存在"，如 mod 未建或解包目录选错，不影响 `ok`），`/api/sources` 与 CLI 同步输出；`resolve_path` 兼容 `None`/`int`/`bytes` 脏配置（原先 `TypeError`）。健壮性实测：7 种路径穿越变体均回落首页且不泄漏源码、`PUT/DELETE/PATCH/OPTIONS/TRACE` 均 501 不崩、`%00`/8KB/中文/emoji/畸形百分号参数均 200、100 次混合请求 RSS 仅 +1.2MB。测试 78 项 |
+| 2026-11-14 | **修复 `/api/traileffect` 连接中断（NameError）**：全量 GET 路由探测发现该接口返回 `RemoteDisconnected` 且服务进程报 `name '_find_trail_effect' is not defined`。根因：`_find_trail_effect` 的 `def` 行丢失（~L7812 只剩 docstring + 循环，成了上一函数 `return` 后的不可达尾段），三处调用（装备新增尾焰预校验 L6352、新建尾焰 L7861、`/api/traileffect` L8638）全部 NameError，异常未被捕获 → 直接关闭连接。补回 `def _find_trail_effect(ref_type)`；新增 `tests/test_server_static.py`（2 项）：AST 扫描"调用了但从未定义/导入的名字"、路由 handler 必须已定义，防同类复发。修复后 53 条 GET 路由实测全 200、全量 78 项测试通过 |
 | 2026-11-14 | **建立数据源表 + 引用注册表（全闭环可查）**：新增 `data_sources.py`：① `SOURCES` 29 个数据源（工程内 config/cache/backup、X4 解包根 assets/units/libraries/index/t/extensions、目标 mod 各目录、解包工具链 cat/staging/XRCatTool、sys.fs、6 个代码内常量、解包任务内存）；② `APIS` 75 条引用（GET 精确 15 / 前缀 38 / POST 21 / 静态页 1），每条声明引用的源 id，`GET+POST` 合并标注；③ `check(env)` 按当前配置展开路径、报存在性与孤儿源；④ `python data_sources.py` 自检、`--md` 生成 `docs/DATA_SOURCES.md`。server.py 新增 `GET /api/sources`（server.py ~L8724 `_g_sources`）返回源表 + 引用表 + 存在性 + 问题清单；新增 `tests/test_data_sources.py` 9 项：AST 解析 `_GET_EXACT`/`_GET_PREFIX`/`do_POST` 与注册表一一对应（前缀顺序也必须一致）、前端 `fetch` 无未注册接口（唯一动态拼接 `fetch("/api/"+ep)` 的 4 个端点单独断言）、每 API 有源、每源有引用、模板变量合法。同步新增 R14 铁律与验证清单；README §六 路由数修正为 GET 53/POST 23 |
 | 2026-11-12 | **装备新增支持跨尺寸（仅 L↔XL）**：`equip_generate()` 新增 `size` 参数（默认跟随模板；非法/不支持直接拒绝），前端 ① 卡片加「装备尺寸」下拉（修改模式只读）。改写链路：`_resize_mount_tags()` 改主挂载连接 tags 尺寸词（缺词补在类型词后；用户显式 `conn_tags` 优先）→ `_swap_size_token()` 改 ID/宏名尺寸词（不一致仅 warning）→ `_resize_refs()` 改弹丸 / 引擎 boosting·traveling·enginedetail / 炮塔 damage 特效引用（目标尺寸资源不存在则保留原值并提示，不制造悬空 ref）。原版引用模板跨尺寸时强制复制组件以写入新 tags；生成结果与内存缓存 `sizes` 写目标尺寸。模型网格不缩放（与 mod 现状一致：XL 装备共用 L 模型），换外观走「引用模型」。回归 `tests/test_equip_size.py` 11 项 |
 | 2026-11-12 | **新增 R6 舰船结构校验器（lint）**：`lint_ship_texts()`（纯文本核心）+ `ship_lint()`（读盘）+ `GET /api/shiplint?ship=<id>`（server.py ~L4008 起）。检查项：兼容标签越界 `E_COMPAT_OVERFLOW`（致命：`max_compat >= groups`）、macro 悬空引用 `E_DANGLING_REF`、内挂宏入口非法 `E_BAD_MACRO_ENTRY`、geometry 缺失 `E_GEO_MISSING`、组结构警告 `W_GROUP_ONLY_TURRET` / `W_ENGINE_NO_SHIELD`、装配槽位缺失 `W_LOADOUT_PATH`、尺寸目录不一致 `W_GEO_SIZE_MISMATCH`。`generate` 在写盘前拦截（`force=1` 可强制），`edit` 只告警不拦截；回归测试 `tests/test_shiplint.py` 7 项。顺带修正 `_dispatch_get` 未剥离查询串导致精确路由带参数时落到静态文件的问题 |

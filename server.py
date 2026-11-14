@@ -7809,6 +7809,7 @@ def bullet_vis_build(d):
     return {"ok": True, "created": created}
 
 
+def _find_trail_effect(ref_type):
     """全局定位参考特效 <effect name=ref_type>...</effect> 完整块，返回 (块, 源文件)。"""
     for pp in _trail_effect_files():
         try:

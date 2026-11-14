@@ -117,6 +117,37 @@ class DataSourceRegistryTest(unittest.TestCase):
         self.assertTrue(rep["ok"], "\n".join(rep["problems"]))
         self.assertEqual(len(rep["sources"]), len(DS.SOURCES))
 
+    def test_optional_missing_is_warning_not_problem(self):
+        """可选源已配置但路径写错：只进 warnings，不影响 ok。"""
+        env = {"BASE": BASE, "CACHE_DIR": os.path.join(BASE, "cache"),
+               "ROOT": r"Z:\__missing_root__", "MOD_DIR": r"Z:\__missing_mod__"}
+        rep = DS.check(env)
+        self.assertTrue(rep["ok"], "\n".join(rep["problems"]))
+        warned = " ".join(rep["warnings"])
+        for sid in ("x4.units", "x4.libraries", "mod.assets"):
+            self.assertIn(sid, warned)
+        self.assertTrue(all("不存在" in w for w in rep["warnings"]))
+
+    def test_unconfigured_optional_source_is_silent(self):
+        """变量没配（ROOT 为空）= 未启用，不进 warnings。"""
+        rep = DS.check({"BASE": BASE, "CACHE_DIR": os.path.join(BASE, "cache")})
+        self.assertTrue(rep["ok"], "\n".join(rep["problems"]))
+        self.assertEqual(rep["warnings"], [])
+
+    def test_required_missing_is_problem(self):
+        """非可选源路径不存在：必须进 problems 并使 ok=False。"""
+        rep = DS.check({"BASE": r"Z:\__no_such_base__"})
+        self.assertFalse(rep["ok"])
+        self.assertTrue(any("app.code" in p for p in rep["problems"]))
+
+    def test_check_survives_non_str_env(self):
+        """env 里混入 None/int/bytes 不得抛异常（配置文件脏数据防崩）。"""
+        rep = DS.check({"BASE": 123, "ROOT": None, "MOD_DIR": 4.5, "CACHE_DIR": b"bytes"})
+        self.assertIn("problems", rep)
+        self.assertIn("warnings", rep)
+        for row in rep["sources"]:
+            self.assertIsInstance(row["resolved"], str)
+
     def test_markdown_export(self):
         md = DS.md()
         self.assertIn("## 一、数据源表", md)

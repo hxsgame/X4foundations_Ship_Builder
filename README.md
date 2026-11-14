@@ -57,7 +57,7 @@ EVE_Ship_Builder/
 ├─ build_release.ps1      发布打包（白名单 4 文件 → dist/*.zip）
 ├─ backup_workdir_to_D.ps1 工作目录镜像备份（robocopy /MIR → D:\TraeCN backup）
 ├─ release/               发布包文本模板（使用说明.txt）
-├─ tests/                 主测试套件（13 个文件 / 72 项）
+├─ tests/                 主测试套件（14 个文件 / 78 项）
 ├─ docs/                  文档
 │   ├─ MAINTENANCE.md     维护文档（架构、模块、事故日志）
 │   ├─ RULES.md           铁律索引（规则 → 代码位置）
@@ -164,7 +164,7 @@ EVE_Ship_Builder/
 **Diff（GET）**：`difflist` · `diffpreview` · `diffvalidate` · `schemas`；（POST）`diffvalidate`
 **基础设施**：`config`（GET/POST） · `moddirs` · `dirtree`（`files:true` 附文件列表） · `pickdir` · `refresh` · `sources`（数据源表/引用表自检）
 
-**数据源与引用**：`GET /api/sources` 返回 `data_sources.py` 的源表 + 引用表 + 当前配置下每个源的真实路径/是否存在/被哪些接口引用；`python data_sources.py` 可在启动前自检，`--md` 重生成 `docs/DATA_SOURCES.md`。
+**数据源与引用**：`GET /api/sources` 返回 `data_sources.py` 的源表 + 引用表 + 当前配置下每个源的真实路径/是否存在/被哪些接口引用，并分级返回 `problems`（硬问题，决定 `ok`）与 `warnings`（可选源已配置但路径不存在）；`python data_sources.py` 可在启动前自检，`--md` 重生成 `docs/DATA_SOURCES.md`。
 
 > 入参与返回结构的权威说明见 `docs/MAINTENANCE.md` 第 2 章；规则与铁律索引见 `docs/RULES.md`。
 
@@ -255,7 +255,7 @@ EVE_Ship_Builder/
 
 ## 七、测试脚本（回归用）
 
-**主测试套件 `tests/`（unittest，72 项）**：`.\run_tests.ps1` 或 `python -m unittest discover -s tests -v`
+**主测试套件 `tests/`（unittest，78 项）**：`.\run_tests.ps1` 或 `python -m unittest discover -s tests -v`
 
 | 文件 | 覆盖 |
 |---|---|

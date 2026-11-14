@@ -397,10 +397,11 @@ def resolve_path(pat, env):
 
     def sub(m):
         k = m.group(1)
-        v = (env or {}).get(k) or ""
-        if not v:
+        v = (env or {}).get(k)
+        if v is None or v == "":
             missing.append(k)
-        return v
+            return ""
+        return str(v)
 
     out = re.sub(r"\{([A-Z_]+)\}", sub, pat or "")
     return out, sorted(set(missing))
@@ -430,10 +431,16 @@ def api_refs():
 
 
 def check(env=None):
-    """运行时自检：路径展开 + 存在性 + 反向引用 + 问题清单。"""
+    """运行时自检：路径展开 + 存在性 + 反向引用 + 问题/告警清单。
+
+    problems：非可选源不可用、未配置、孤儿源、引用不存在 → ok=False。
+    warnings：可选源"变量已配置但路径不存在"（如 mod 还没建、解包目录选错）
+               → 仅提示，不影响 ok。
+    """
     env = env or {}
     refs = api_refs()
     problems = []
+    warnings = []
     rows = []
     for sid, meta in SOURCES.items():
         resolved, missing = resolve_path(meta.get("path"), env)
@@ -442,8 +449,11 @@ def check(env=None):
         unconfigured = bool(missing)
         if unconfigured and not meta.get("optional"):
             problems.append("%s：路径变量未配置 %s" % (sid, ",".join(missing)))
-        if exists is False and not meta.get("optional") and not unconfigured:
-            problems.append("%s：路径不存在 %s" % (sid, resolved))
+        if exists is False and not unconfigured:
+            if meta.get("optional"):
+                warnings.append("%s：已配置但路径不存在 %s" % (sid, resolved))
+            else:
+                problems.append("%s：路径不存在 %s" % (sid, resolved))
         if not refs.get(sid):
             problems.append("%s：无任何 API 引用（孤儿源）" % sid)
         rows.append({
@@ -460,8 +470,8 @@ def check(env=None):
         for sid in src:
             if sid not in SOURCES:
                 problems.append("%s：引用了未注册的数据源 %s" % (path, sid))
-    return {"ok": not problems, "problems": problems, "sources": rows,
-            "apis": APIS, "env_keys": list(ENV_KEYS)}
+    return {"ok": not problems, "problems": problems, "warnings": warnings,
+            "sources": rows, "apis": APIS, "env_keys": list(ENV_KEYS)}
 
 
 def match_api(path):
@@ -499,8 +509,8 @@ def md():
     for sid in SOURCES:
         lines.append("| `%s` | %s |" % (sid, "、".join("`%s`" % p for p in (refs.get(sid) or []))))
     lines += ["", "## 四、运行时可查", "",
-              "- `GET /api/sources`：返回本表 + 当前配置下每个源展开后的真实路径、是否存在、被谁引用、问题清单。",
-              "- `python data_sources.py`：启动前自检（退出码非 0 即有问题）。", ""]
+              "- `GET /api/sources`：返回本表 + 当前配置下每个源展开后的真实路径、是否存在、被谁引用、`problems`（硬问题，决定 `ok`）与 `warnings`（可选源已配置但路径不存在，仅提示）。",
+              "- `python data_sources.py`：启动前自检（`problems` 非空则退出码非 0；`warnings` 只打印）。", ""]
     return "\n".join(lines)
 
 
@@ -519,6 +529,10 @@ def _main():
         for p in rep["problems"]:
             print("  -", p)
         return 1
+    if rep["warnings"]:
+        print("告警 %d 条（可选源已配置但路径不存在，不影响通过）：" % len(rep["warnings"]))
+        for w in rep["warnings"]:
+            print("  -", w)
     print("OK：引用闭环完整（无孤儿源、无未声明源的 API）")
     return 0
 
