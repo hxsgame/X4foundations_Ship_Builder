@@ -256,6 +256,7 @@ EVE_Ship_Builder/
 ├── index.html                 ← 前端单文件（全部 UI + JS，4112 行）
 ├── server.py                  ← 后端单文件（全部 API + X4 解析，9273 行）
 ├── x4_lookup.py               ← t 文本/名称解析（X4Lookup）
+├── data_sources.py            ← 数据源表 + 引用注册表（SOURCES / APIS / check）
 ├── 启动服务.bat                ← 双击启动（python server.py :8765）
 ├── builder_config.json        ← 本机配置（root / target_mod / id_suffix，gitignore）
 ├── run_tests.ps1              ← 测试入口（unittest + ast）
@@ -263,10 +264,11 @@ EVE_Ship_Builder/
 ├── backup_workdir_to_D.ps1    ← 工作目录镜像备份（gitignore）
 ├── _shipmodel_backup/         ← 生成/编辑自动备份（滚动 3 次）
 ├── cache/                     ← 扫描缓存（gitignore）
-├── tests/                     ← 主测试套件（12 文件 / 63 项）
+├── tests/                     ← 主测试套件（13 文件 / 72 项）
 ├── docs/
 │   ├── MAINTENANCE.md         ← 本文件（架构 + 模块 + 事故日志）
 │   ├── RULES.md               ← 铁律索引（规则 → 代码位置）
+│   ├── DATA_SOURCES.md        ← 数据源表与引用注册表（自动生成，勿手改）
 │   ├── JOBS_SHIPGROUPS_MECHANISM.md
 │   ├── BLENDER_组件缩放导出需求.md
 │   ├── 项目总结与优化报告_2026-11-06.md
@@ -296,6 +298,7 @@ EVE_Ship_Builder/
 
 | 日期 | 内容 |
 |---|---|
+| 2026-11-14 | **建立数据源表 + 引用注册表（全闭环可查）**：新增 `data_sources.py`：① `SOURCES` 29 个数据源（工程内 config/cache/backup、X4 解包根 assets/units/libraries/index/t/extensions、目标 mod 各目录、解包工具链 cat/staging/XRCatTool、sys.fs、6 个代码内常量、解包任务内存）；② `APIS` 75 条引用（GET 精确 15 / 前缀 38 / POST 21 / 静态页 1），每条声明引用的源 id，`GET+POST` 合并标注；③ `check(env)` 按当前配置展开路径、报存在性与孤儿源；④ `python data_sources.py` 自检、`--md` 生成 `docs/DATA_SOURCES.md`。server.py 新增 `GET /api/sources`（server.py ~L8724 `_g_sources`）返回源表 + 引用表 + 存在性 + 问题清单；新增 `tests/test_data_sources.py` 9 项：AST 解析 `_GET_EXACT`/`_GET_PREFIX`/`do_POST` 与注册表一一对应（前缀顺序也必须一致）、前端 `fetch` 无未注册接口（唯一动态拼接 `fetch("/api/"+ep)` 的 4 个端点单独断言）、每 API 有源、每源有引用、模板变量合法。同步新增 R14 铁律与验证清单；README §六 路由数修正为 GET 53/POST 23 |
 | 2026-11-12 | **装备新增支持跨尺寸（仅 L↔XL）**：`equip_generate()` 新增 `size` 参数（默认跟随模板；非法/不支持直接拒绝），前端 ① 卡片加「装备尺寸」下拉（修改模式只读）。改写链路：`_resize_mount_tags()` 改主挂载连接 tags 尺寸词（缺词补在类型词后；用户显式 `conn_tags` 优先）→ `_swap_size_token()` 改 ID/宏名尺寸词（不一致仅 warning）→ `_resize_refs()` 改弹丸 / 引擎 boosting·traveling·enginedetail / 炮塔 damage 特效引用（目标尺寸资源不存在则保留原值并提示，不制造悬空 ref）。原版引用模板跨尺寸时强制复制组件以写入新 tags；生成结果与内存缓存 `sizes` 写目标尺寸。模型网格不缩放（与 mod 现状一致：XL 装备共用 L 模型），换外观走「引用模型」。回归 `tests/test_equip_size.py` 11 项 |
 | 2026-11-12 | **新增 R6 舰船结构校验器（lint）**：`lint_ship_texts()`（纯文本核心）+ `ship_lint()`（读盘）+ `GET /api/shiplint?ship=<id>`（server.py ~L4008 起）。检查项：兼容标签越界 `E_COMPAT_OVERFLOW`（致命：`max_compat >= groups`）、macro 悬空引用 `E_DANGLING_REF`、内挂宏入口非法 `E_BAD_MACRO_ENTRY`、geometry 缺失 `E_GEO_MISSING`、组结构警告 `W_GROUP_ONLY_TURRET` / `W_ENGINE_NO_SHIELD`、装配槽位缺失 `W_LOADOUT_PATH`、尺寸目录不一致 `W_GEO_SIZE_MISMATCH`。`generate` 在写盘前拦截（`force=1` 可强制），`edit` 只告警不拦截；回归测试 `tests/test_shiplint.py` 7 项。顺带修正 `_dispatch_get` 未剥离查询串导致精确路由带参数时落到静态文件的问题 |
 | 2026-11-12 | **文档体系三分工 + 一致性收口（无代码改动）**：① 新建 [RULES.md](RULES.md)（R1~R13 铁律 → 代码位置 + 验证清单）；② README 修正行数（server.py 8883 / index.html 4046）、补充完整目录树、重写选项卡表（补引擎/解包/Diff）、接口速查改为按域分组（GET 51 / POST 23）、测试表补 `tests/` 10 文件、待办只留 POST 路由化/前端收敛/拆模块；③ 本文件修正「最后更新」、§1 持久化与备份路径（`builder_config` 实际字段、`_shipmodel_backup\`）、§2.1 卡片表按真实 UI 顺序重写（①~⑨ + 软件 + ⑥-1/⑤-1/⑧-1）、§2.2 装备改为「5 选项卡 + 弹药两子页」、§7 文件清单重写；④ 交接文档（2026-10-12）降级归档至 `docs/archive/`，标题去掉「唯一基准」并加过时提示 |

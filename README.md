@@ -50,16 +50,18 @@ EVE_Ship_Builder/
 ├─ server.py              后端主程序（路由 + 舰船/装备/特效生成，9273 行）
 ├─ index.html             前端单页（10 个选项卡，4112 行）
 ├─ x4_lookup.py           X4 文本/名称解析（X4Lookup 类，210 行）
+├─ data_sources.py        数据源表 + 引用注册表（源/接口闭环，见 docs/DATA_SOURCES.md）
 ├─ 启动服务.bat            双击启动（python server.py，端口 8765）
 ├─ builder_config.json    本机配置（root / target_mod / mode / backup_root / id_suffix，gitignore）
 ├─ run_tests.ps1          测试入口（unittest + ast 校验）
 ├─ build_release.ps1      发布打包（白名单 4 文件 → dist/*.zip）
 ├─ backup_workdir_to_D.ps1 工作目录镜像备份（robocopy /MIR → D:\TraeCN backup）
 ├─ release/               发布包文本模板（使用说明.txt）
-├─ tests/                 主测试套件（12 个文件 / 63 项）
+├─ tests/                 主测试套件（13 个文件 / 72 项）
 ├─ docs/                  文档
 │   ├─ MAINTENANCE.md     维护文档（架构、模块、事故日志）
 │   ├─ RULES.md           铁律索引（规则 → 代码位置）
+│   ├─ DATA_SOURCES.md    数据源表与引用注册表（由 data_sources.py 生成）
 │   ├─ JOBS_SHIPGROUPS_MECHANISM.md
 │   ├─ BLENDER_组件缩放导出需求.md
 │   ├─ 项目总结与优化报告_2026-11-06.md
@@ -145,7 +147,8 @@ EVE_Ship_Builder/
 
 ## 六、后端接口速查（server.py 路由）
 
-路由定义集中在 `_GET_EXACT` / `_GET_PREFIX`（server.py ~L8337）与 `do_POST` 白名单（~L8433）。当前 **GET 52 条**（14 精确 + 38 前缀）、**POST 23 条**。
+路由定义集中在 `_GET_EXACT` / `_GET_PREFIX`（server.py ~L8729）与 `do_POST` 白名单（~L8840）。当前 **GET 53 条**（15 精确 + 38 前缀）、**POST 23 条**。
+路由与前端调用都必须登记在 `data_sources.py` 的 `APIS`（数据源 ↔ 引用注册表，见 §六末与 `docs/DATA_SOURCES.md`）。
 
 **舰船（GET）**：`templates` · `stats` · `enums` · `factions` · `costrefs` · `component?ship=` · `shiploadout` · `shipjobs` · `shipconnections` · `shipgroups?ship=` · `shipgroups/all` · `shipmaterials` · `shipsoftware` · `softwarelist` · `loadoutmacros` · `shiplint?ship=`（结构体检）
 **舰船（POST）**：`generate` · `edit` · `delitem`
@@ -159,7 +162,9 @@ EVE_Ship_Builder/
 **资产复用（POST）**：`shipmodelsync`（入参 `ship_id / export_root / py_path / mod / overlay`，`overlay` 留空 = `<mod>\moding`） · `componentassemble` · `dockclone`（入参 `tpl / new_id / wp_xml / mod / overlay`）；模板列表 `docklist`（GET）
 **解包（GET）**：`unpackscan?game=` · `unpackstatus`；（POST）`unpack`（入参 `game / out / xtool / mode / sources`，后台线程） · `unpackcancel`
 **Diff（GET）**：`difflist` · `diffpreview` · `diffvalidate` · `schemas`；（POST）`diffvalidate`
-**基础设施**：`config`（GET/POST） · `moddirs` · `dirtree`（`files:true` 附文件列表） · `pickdir` · `refresh`
+**基础设施**：`config`（GET/POST） · `moddirs` · `dirtree`（`files:true` 附文件列表） · `pickdir` · `refresh` · `sources`（数据源表/引用表自检）
+
+**数据源与引用**：`GET /api/sources` 返回 `data_sources.py` 的源表 + 引用表 + 当前配置下每个源的真实路径/是否存在/被哪些接口引用；`python data_sources.py` 可在启动前自检，`--md` 重生成 `docs/DATA_SOURCES.md`。
 
 > 入参与返回结构的权威说明见 `docs/MAINTENANCE.md` 第 2 章；规则与铁律索引见 `docs/RULES.md`。
 
@@ -250,7 +255,7 @@ EVE_Ship_Builder/
 
 ## 七、测试脚本（回归用）
 
-**主测试套件 `tests/`（unittest，63 项）**：`.\run_tests.ps1` 或 `python -m unittest discover -s tests -v`
+**主测试套件 `tests/`（unittest，72 项）**：`.\run_tests.ps1` 或 `python -m unittest discover -s tests -v`
 
 | 文件 | 覆盖 |
 |---|---|

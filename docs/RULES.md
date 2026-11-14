@@ -1,8 +1,8 @@
 # EVE_Ship_Builder 铁律索引
 
-> 最后更新：2026-11-12
+> 最后更新：2026-11-14
 > 定位：**规则 → 代码位置**的速查表。每条规则只写"必须怎样 + 违反的后果 + 由谁保证"，事故过程与排错记录见 [MAINTENANCE.md](MAINTENANCE.md)。
-> 新增功能前先扫一遍 R1/R2/R5/R6/R8；改完后跑 R13 的验证清单。
+> 新增功能前先扫一遍 R1/R2/R5/R6/R8/R14；改完后跑 R13 的验证清单。
 
 ---
 
@@ -115,12 +115,22 @@
 | 代码 | `upsert_effect`（~L6740）、`finish_write`（~L6771）、`explosion_build`、`bullet_effect_build`、`trail_build`、`bullet_beam_build`、`bullet_vis_build` |
 | 注意 | 收尾的 `copy_to_moding + 缓存刷新` 不允许再包 `try/except: pass` |
 
+## R14 数据源与引用注册表（2026-11-14 建立）
+
+| 项 | 内容 |
+|---|---|
+| 规则 | ① 任何数据访问都必须能追溯到 `data_sources.py` 的 `SOURCES`（文件/目录/常量/内存/请求参数）；② 任何后端路由与前端 `fetch("/api/...")` 必须在 `APIS` 登记并声明引用的源；③ 新增数据源类型或新增引用时，先改 `SOURCES`/`APIS`，再跑自检与测试；④ `docs/DATA_SOURCES.md` 由 `python data_sources.py --md` 生成，不手改 |
+| 后果 | 漏登记 = 修改时找不到上下游线索、改路径漏改、前端调未注册接口；孤儿源 = 数据来源失去维护入口 |
+| 代码 | `data_sources.py`（SOURCES / APIS / check / match_api / md）；`GET /api/sources` 运行时自检（返回每个源展开路径、存在性、被谁引用、问题清单）；server.py 顶部 `import data_sources` |
+| 校验 | `python data_sources.py`（退出码非 0 即有问题）+ `tests/test_data_sources.py`（路由一一对应、前端无未注册调用、每 API 有源、每源有引用） |
+
 ---
 
 ## 验证清单（每次改代码后）
 
 1. `python -c "import ast; ast.parse(open('server.py',encoding='utf-8').read())"`
-2. `.\run_tests.ps1`（unittest 63 项 + ast）
+2. `.\run_tests.ps1`（unittest 72 项 + ast）
 3. 改 index.html 后：`node --check` 抽取的 JS 块（或浏览器控制台无语法错误）
-4. **结束 8765 旧进程再重启**，冒烟 `/api/templates`、`/api/config`
-5. 涉及 X4 结构的改动：Vortex Deploy → 进游戏 → 看 `Documents\Egosoft\X4\<id>\debuglog.txt` 有无 LIBXML2 / `@Artists` / meshsource 报错
+4. 改数据源/接口后：`python data_sources.py` + `python data_sources.py --md` 重生成 `docs/DATA_SOURCES.md`
+5. **结束 8765 旧进程再重启**，冒烟 `/api/templates`、`/api/config`、`/api/sources`
+6. 涉及 X4 结构的改动：Vortex Deploy → 进游戏 → 看 `Documents\Egosoft\X4\<id>\debuglog.txt` 有无 LIBXML2 / `@Artists` / meshsource 报错

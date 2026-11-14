@@ -10,6 +10,7 @@ t 名称、index 注册），直接写入目标 mod 目录。
 """
 import http.server, json, os, re, shutil, socketserver, threading, time, statistics, glob, tempfile
 from x4_lookup import X4Lookup
+import data_sources   # 数据源表 + 引用注册表（/api/sources 自检用）
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE, "builder_config.json")
@@ -8721,7 +8722,14 @@ def _g_diffpreview(h):
              "base_txt": base_txt, "patched_txt": _apply_diff_ops(base_txt, diff_txt)})
 
 # 精确匹配优先（如 /api/shipgroups/all 必须先于前缀 /api/shipgroups）
+def _g_sources(h):
+    """数据源表 + 引用注册表自检：当前配置下每个源的真实路径/存在性/反向引用。"""
+    env = {"BASE": BASE, "ROOT": ROOT, "MOD_DIR": MOD_DIR,
+           "BACKUP_ROOT": BACKUP_ROOT, "CACHE_DIR": _CACHE_DIR}
+    h._json(data_sources.check(env))
+
 _GET_EXACT = {
+    "/api/sources": _g_sources,
     "/api/templates": lambda h: h._json(list_templates()),
     "/api/stats": lambda h: h._json(vanilla_stats()),
     "/api/enums": lambda h: h._json(vanilla_enums()),
